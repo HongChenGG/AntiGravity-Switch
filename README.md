@@ -128,8 +128,8 @@ flowchart TD
 
 ```bash
 # 1. 克隆本仓库
-git clone https://github.com/your-username/antigravity-status-extension.git
-cd antigravity-status-extension
+git clone https://github.com/HongChenGG/AntiGravity-Switch.git
+cd AntiGravity-Switch
 
 # 2. 安装依赖
 npm install
