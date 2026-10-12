@@ -55,10 +55,11 @@
   - 🪟 重载 VS Code 窗口 (Reload Window)
   - ⚙️ 打开插件设置
 
-### 2. 通过 OAuth Refresh Token 导入账号
-- 在仪表盘或菜单点击 **“➕ 导入账号”**；
-- 依次输入 Google 邮箱（例如 `user@gmail.com`）与 OAuth Refresh Token（通常以 `1//...` 开头）；
-- 插件将自动创建账号凭据文件，并联动底层工具向 Google Cloud 验证并拉取初始配额；
+### 2. 账号导入与 Google 授权登录（双模式支持）
+- 在仪表盘或菜单点击 **“➕ 导入账号 (Token)”**，提供两种最便捷的方式：
+  - 🌐 **浏览器跳转 Google 登录（一键授权 · 推荐）**：自动拉起系统浏览器打开 Google 官方授权页，在浏览器点击授权后，自动回调完成登录并同步凭据与配额，全程无需手动复制任何 Token！
+  - 🔑 **直接填 Token / Refresh Token（免输邮箱）**：直接粘贴 `1//` 开头的 Refresh Token 或 Access Token，插件自动通过 Google OAuth 端点解析出对应 Google 邮箱与用户名并建立凭据，无需手动输入邮箱。
+  - 📋 **粘贴完整 JSON 凭据**：支持直接粘贴包含 `refresh_token` 等信息的 JSON 文本自动导入。
 - 导入成功后提示“是否立即切换至该账号”，点击即可瞬间切换使用。
 
 ---

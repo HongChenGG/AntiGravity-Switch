@@ -480,7 +480,10 @@ export class AntigravityService {
 
   public async importAccount(
     email: string,
-    refreshToken: string
+    refreshToken: string,
+    accessToken?: string,
+    idToken?: string,
+    name?: string
   ): Promise<{ success: boolean; message: string; accountId?: string }> {
     const toolsDir = getAntigravityToolsDir();
     const accountsJsonPath = path.join(toolsDir, 'accounts.json');
@@ -497,12 +500,14 @@ export class AntigravityService {
     const id = crypto.randomUUID();
     const now = Math.floor(Date.now() / 1000);
 
+    const finalName = name || email.trim().split('@')[0];
+
     const accountDetail = {
       id,
       email: email.trim(),
-      name: email.trim().split('@')[0],
+      name: finalName,
       token: {
-        access_token: '',
+        access_token: accessToken || '',
         refresh_token: refreshToken.trim(),
         expires_in: 3599,
         expiry_timestamp: now + 3599,
@@ -511,6 +516,7 @@ export class AntigravityService {
         project_id: 'aicode-consumers',
         oauth_client_key: 'antigravity_enterprise',
         is_gcp_tos: false,
+        id_token: idToken || '',
       },
       quota: null,
     };

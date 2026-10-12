@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.CommandController = void 0;
 const vscode = __importStar(require("vscode"));
 const dashboardPanel_1 = require("./dashboardPanel");
+const oauth_1 = require("./oauth");
 const utils_1 = require("./utils");
 class CommandController {
     context;
@@ -247,52 +248,110 @@ class CommandController {
         }
     }
     async importAccount() {
-        const email = await vscode.window.showInputBox({
-            title: '导入 Google Antigravity 账号',
-            prompt: '请输入 Google 账号邮箱 (例如: your-account@gmail.com)',
-            placeHolder: 'user@gmail.com',
-            ignoreFocusOut: true,
-            validateInput: (val) => {
-                if (!val || !val.includes('@')) {
-                    return '请输入有效的邮箱地址';
-                }
-                return null;
+        const items = [
+            {
+                id: 'browser',
+                label: '$(globe) 🌐 浏览器跳转 Google 登录 (一键授权 · 推荐)',
+                description: '自动拉起系统浏览器进行 Google 官方 OAuth 授权，无需手动复制 Token',
             },
+            {
+                id: 'paste-token',
+                label: '$(key) 🔑 直接填 Token / Refresh Token (免输邮箱)',
+                description: '直接粘贴 1// 开头的 Refresh Token，插件将自动解析 Google 邮箱并建立凭据',
+            },
+            {
+                id: 'paste-json',
+                label: '$(json) 📋 粘贴完整 JSON 凭据',
+                description: '粘贴包含 refresh_token、email 等字段的完整 JSON 格式凭据',
+            },
+        ];
+        const selected = await vscode.window.showQuickPick(items, {
+            placeHolder: '请选择导入 / 登录 Google 账号的方式...',
         });
-        if (!email) {
+        if (!selected) {
             return;
         }
-        const refreshToken = await vscode.window.showInputBox({
-            title: '导入 Google Antigravity 账号',
-            prompt: '请输入 OAuth Refresh Token (以 1// 开头)',
-            placeHolder: '1//0g...',
-            password: true,
+        if (selected.id === 'browser') {
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: '已在浏览器打开 Google 登录页，等待授权回调...',
+                cancellable: false,
+            }, async () => {
+                try {
+                    const authRes = await (0, oauth_1.loginWithGoogleBrowser)();
+                    const res = await this.service.importAccount(authRes.email, authRes.refreshToken, authRes.accessToken, authRes.idToken, authRes.name);
+                    if (res.success) {
+                        await this.refreshCallback();
+                        const action = await vscode.window.showInformationMessage(`🎉 账号 ${authRes.email} 授权成功！是否立即切换使用？`, '立即切换', '稍后切换');
+                        if (action === '立即切换') {
+                            await this.switchAccount(authRes.email);
+                        }
+                    }
+                    else {
+                        vscode.window.showErrorMessage(`导入账号失败: ${res.message}`);
+                    }
+                }
+                catch (err) {
+                    vscode.window.showErrorMessage(`Google 登录失败: ${err.message || String(err)}`);
+                }
+            });
+            return;
+        }
+        // paste-token or paste-json
+        const promptText = selected.id === 'paste-token'
+            ? '请粘贴 OAuth Refresh Token (以 1// 开头，将自动提取对应 Google 邮箱)'
+            : '请粘贴包含 refresh_token 的完整 JSON 凭据文本';
+        const rawInput = await vscode.window.showInputBox({
+            title: '导入 Google Antigravity 账号 Token',
+            prompt: promptText,
+            placeHolder: selected.id === 'paste-token'
+                ? '1//0g...'
+                : '{"refresh_token": "1//...", "email": "user@gmail.com"}',
+            password: selected.id === 'paste-token',
             ignoreFocusOut: true,
             validateInput: (val) => {
-                if (!val || val.trim().length < 10) {
-                    return 'Refresh Token 格式不正确，通常以 1// 开头';
+                if (!val || val.trim().length < 15) {
+                    return 'Token 内容过短，请提供有效的凭据';
                 }
                 return null;
             },
         });
-        if (!refreshToken) {
+        if (!rawInput) {
             return;
         }
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
-            title: `正在导入账号 ${email} 并初始化配额...`,
+            title: '正在校验 Token 并初始化配额...',
             cancellable: false,
         }, async () => {
-            const res = await this.service.importAccount(email.trim(), refreshToken.trim());
-            if (res.success) {
-                await this.refreshCallback();
-                const action = await vscode.window.showInformationMessage(`🎉 ${res.message} 是否立即切换至该账号？`, '立即切换', '稍后切换');
-                if (action === '立即切换') {
-                    await this.switchAccount(email.trim());
+            try {
+                const resolved = await (0, oauth_1.resolveTokenInfo)(rawInput.trim());
+                let finalEmail = resolved.email;
+                if (!finalEmail) {
+                    finalEmail =
+                        (await vscode.window.showInputBox({
+                            title: '确认账号邮箱',
+                            prompt: '未能从该 Token 中自动解析出 Google 邮箱，请输入该账号邮箱',
+                            placeHolder: 'user@gmail.com',
+                            ignoreFocusOut: true,
+                        })) || '';
+                    if (!finalEmail)
+                        return;
+                }
+                const res = await this.service.importAccount(finalEmail.trim(), resolved.refreshToken, resolved.accessToken, resolved.idToken, resolved.name);
+                if (res.success) {
+                    await this.refreshCallback();
+                    const action = await vscode.window.showInformationMessage(`🎉 账号 ${finalEmail} 导入成功！是否立即切换使用？`, '立即切换', '稍后切换');
+                    if (action === '立即切换') {
+                        await this.switchAccount(finalEmail.trim());
+                    }
+                }
+                else {
+                    vscode.window.showErrorMessage(`导入账号失败: ${res.message}`);
                 }
             }
-            else {
-                vscode.window.showErrorMessage(`导入账号失败: ${res.message}`);
+            catch (err) {
+                vscode.window.showErrorMessage(`解析 Token 失败: ${err.message || String(err)}`);
             }
         });
     }

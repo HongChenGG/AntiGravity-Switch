@@ -482,7 +482,7 @@ class AntigravityService {
             };
         }
     }
-    async importAccount(email, refreshToken) {
+    async importAccount(email, refreshToken, accessToken, idToken, name) {
         const toolsDir = (0, utils_1.getAntigravityToolsDir)();
         const accountsJsonPath = path.join(toolsDir, 'accounts.json');
         const accountsDir = path.join(toolsDir, 'accounts');
@@ -495,12 +495,13 @@ class AntigravityService {
         const crypto = await Promise.resolve().then(() => __importStar(require('crypto')));
         const id = crypto.randomUUID();
         const now = Math.floor(Date.now() / 1000);
+        const finalName = name || email.trim().split('@')[0];
         const accountDetail = {
             id,
             email: email.trim(),
-            name: email.trim().split('@')[0],
+            name: finalName,
             token: {
-                access_token: '',
+                access_token: accessToken || '',
                 refresh_token: refreshToken.trim(),
                 expires_in: 3599,
                 expiry_timestamp: now + 3599,
@@ -509,6 +510,7 @@ class AntigravityService {
                 project_id: 'aicode-consumers',
                 oauth_client_key: 'antigravity_enterprise',
                 is_gcp_tos: false,
+                id_token: idToken || '',
             },
             quota: null,
         };
