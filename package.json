@@ -1,0 +1,134 @@
+{
+  "name": "antigravity-status-bar",
+  "displayName": "Google Antigravity Status & Reload",
+  "description": "VS Code 状态栏反重力插件监控：实时展示 5小时配额、周配额、高颜值Token仪表盘，并提供外部切号自动热重载与OAuth Token账号导入",
+  "version": "1.5.0",
+  "publisher": "local-dev",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/username/antigravity-status-bar"
+  },
+  "keywords": [
+    "antigravity",
+    "gemini",
+    "ai",
+    "quota",
+    "token",
+    "switch-account",
+    "dashboard"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "antigravity-status.showMenu",
+        "title": "反重力: 打开管理菜单",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-status.showDashboard",
+        "title": "反重力: 打开高级监控仪表盘 (Dashboard)",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-status.refresh",
+        "title": "反重力: 刷新状态与统计",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-status.importAccount",
+        "title": "反重力: 导入账号 (OAuth Refresh Token)",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-status.reloadExtensionHost",
+        "title": "反重力: 重新加载反重力插件 (热重启生效)",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-status.restartBackend",
+        "title": "反重力: 强制冷重启核心后端 (agy.exe)",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-status.switchAccount",
+        "title": "反重力: 切换账号 (免重启 VS Code)",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-status.statusBarClicked",
+        "title": "反重力: 状态栏点击操作",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-status.reloadWindow",
+        "title": "反重力: 重载 VS Code 窗口",
+        "category": "Antigravity"
+      }
+    ],
+    "configuration": {
+      "title": "反重力状态监控 (Antigravity Status)",
+      "properties": {
+        "antigravityStatus.agySwitchPath": {
+          "type": "string",
+          "default": "",
+          "description": "agy-switch 可执行文件路径。留空则自动检测 (如 D:\\agy-switch\\agy-switch.exe 或 PATH)"
+        },
+        "antigravityStatus.refreshIntervalSeconds": {
+          "type": "number",
+          "default": 5,
+          "description": "自动刷新状态的间隔时间 (秒)，默认 5 秒 (超轻量0.1ms读取)"
+        },
+        "antigravityStatus.statusBarClickAction": {
+          "type": "string",
+          "enum": [
+            "dashboard",
+            "menu"
+          ],
+          "default": "dashboard",
+          "description": "点击状态栏时的默认操作: dashboard (直接打开高颜值仪表盘), menu (打开快捷菜单)"
+        },
+        "antigravityStatus.autoSyncOnlineOnTurn": {
+          "type": "boolean",
+          "default": true,
+          "description": "当反重力生成完成时，是否自动在后台向云端同步刷新最新配额 (保持与官方一致)"
+        },
+        "antigravityStatus.displayFormat": {
+          "type": "string",
+          "enum": [
+            "standard",
+            "5h-only",
+            "compact",
+            "full"
+          ],
+          "default": "standard",
+          "description": "状态栏文字显示格式: standard (5h配额 + 周配额 + 今日Token), 5h-only (仅5h配额 + 今日Token), compact (仅5h配额), full (详细)"
+        },
+        "antigravityStatus.autoReloadOnSwitch": {
+          "type": "boolean",
+          "default": true,
+          "description": "当在外部软件切换账号时，是否自动重启核心进程并热重载 VS Code 插件使新账号立即生效 (免手动关闭重新打开 VS Code)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.4.0"
+  }
+}
