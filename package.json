@@ -2,7 +2,7 @@
   "name": "antigravity-status-bar",
   "displayName": "Google Antigravity Status & Reload",
   "description": "VS Code 状态栏反重力插件监控：实时展示 5小时配额、周配额、高颜值Token仪表盘，并提供外部切号自动热重载与OAuth Token账号导入",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "publisher": "local-dev",
   "engines": {
     "vscode": "^1.80.0"

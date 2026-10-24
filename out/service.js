@@ -560,8 +560,12 @@ class AntigravityService {
         }
         catch (err) {
             const msg = err?.message || String(err) || '';
-            // taskkill 找不到进程时返回非零退出码，这不是错误
-            if (/128|not found|找不到|没有/i.test(msg)) {
+            const code = typeof err?.code === 'number' ? err.code : null;
+            // 用退出码判断而非消息文本：taskkill 输出是 GBK 中文，经 Node 捕获后是乱码无法匹配。
+            // taskkill 128 = 没有找到进程；pkill 1 = 无匹配进程 —— 都表示"未在运行"
+            if (code === 128 ||
+                (process.platform !== 'win32' && code === 1) ||
+                /not found|找不到|没有/i.test(msg)) {
                 return { success: true, message: 'agy.exe 未在运行，无需终止。' };
             }
             return {
