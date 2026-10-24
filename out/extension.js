@@ -42,6 +42,7 @@ const commands_1 = require("./commands");
 let refreshTimer = null;
 let currentStatus = null;
 let isRefreshing = false;
+let needsRefresh = false;
 function activate(context) {
     const service = new service_1.AntigravityService();
     const statusBar = new statusBar_1.StatusBarController();
@@ -56,8 +57,10 @@ function activate(context) {
         }, 1200);
     }
     const refresh = async () => {
-        // 定时器间隔可能小于 fetchStatus 耗时（CLI 慢时可达数秒），防止刷新堆叠
+        // 定时器间隔可能小于 fetchStatus 耗时（CLI 慢时可达数秒），防止刷新堆叠；
+        // 进行中到达的刷新不丢弃，结束后补跑一次（配额文件变动事件不丢）
         if (isRefreshing) {
+            needsRefresh = true;
             return;
         }
         isRefreshing = true;
@@ -71,6 +74,10 @@ function activate(context) {
         }
         finally {
             isRefreshing = false;
+            if (needsRefresh) {
+                needsRefresh = false;
+                refresh();
+            }
         }
     };
     const commandController = new commands_1.CommandController(context, service, refresh, () => currentStatus);

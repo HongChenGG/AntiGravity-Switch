@@ -3,7 +3,7 @@
 > 专为 **Google Antigravity**（反重力）打造的高性能 VS Code 状态监控、配额预警、多账号免关窗无感切换与高颜值仪表盘伴侣插件。
 
 [![VS Code Extension](https://img.shields.io/badge/VS%20Code-v1.80.0+-007acc.svg?logo=visualstudiocode)](https://marketplace.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.6.3-blue.svg)](https://github.com/)
+[![Version](https://img.shields.io/badge/version-1.7.0-blue.svg)](https://github.com/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4+-3178c6.svg?logo=typescript)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 

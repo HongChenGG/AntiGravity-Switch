@@ -272,7 +272,7 @@ export class AntigravityService {
    */
   private async fetchStatsCached(): Promise<TokenStats | null> {
     const config = vscode.workspace.getConfiguration('antigravityStatus');
-    const ttlMs = Math.max(1, config.get<number>('statsCacheSeconds', 3)) * 1000;
+    const ttlMs = Math.max(1, config.get<number>('statsCacheSeconds', 5)) * 1000;
 
     if (this.statsCache && Date.now() - this.statsCache.ts < ttlMs) {
       return this.statsCache.data;
@@ -443,8 +443,22 @@ export class AntigravityService {
     };
   }
 
-  public async fetchAccountsList(): Promise<AccountInfo[]> {
+  /**
+   * 账号总数：只读 accounts.json 一个文件。
+   * 仪表盘高频轮询用这个，不要为拿个数把全部账号详情文件读一遍。
+   */
+  public countAccounts(): number {
     const toolsDir = getAntigravityToolsDir();
+    const accountsJsonPath = path.join(toolsDir, 'accounts.json');
+    try {
+      const data = JSON.parse(fs.readFileSync(accountsJsonPath, 'utf-8'));
+      return Array.isArray(data.accounts) ? data.accounts.length : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  public async fetchAccountsList(): Promise<AccountInfo[]> {    const toolsDir = getAntigravityToolsDir();
     const accountsJsonPath = path.join(toolsDir, 'accounts.json');
 
     if (fs.existsSync(accountsJsonPath)) {
@@ -523,17 +537,16 @@ export class AntigravityService {
       }
 
       const newId = this.getCurrentAccountId();
-      if (newId) {
-        try {
-          await execFileAsync(executable, ['refresh', newId, '--json'], {
+      // 云端配额刷新与重启后端并行：refresh 独立连 Google、不依赖 agy.exe，
+      // 串行等待会白白多花最多 6 秒
+      const refreshPromise = newId
+        ? execFileAsync(executable, ['refresh', newId, '--json'], {
             timeout: 6000,
             encoding: 'utf-8',
             env: this.getExecEnv(),
-          });
-        } catch {}
-      }
-
-      await this.restartAgyBackend();
+          }).catch(() => {})
+        : Promise.resolve();
+      await Promise.all([refreshPromise, this.restartAgyBackend()]);
       this.notifyStatusChanged();
 
       return {

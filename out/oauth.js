@@ -67,7 +67,13 @@ function requestGoogleApi(urlStr, postData) {
             resolve({ status: status || 200, data });
         });
         const fail = (err) => settle(() => reject(err));
+        let directTried = false;
         const doDirect = () => {
+            // timeout 与 error 可能先后触发，直连重试只允许一次
+            if (directTried) {
+                return;
+            }
+            directTried = true;
             const req = https.request(urlStr, {
                 method: postData ? 'POST' : 'GET',
                 headers: postData

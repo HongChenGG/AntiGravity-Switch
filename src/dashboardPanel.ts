@@ -123,6 +123,17 @@ export class DashboardPanel {
 
     this.update();
 
+    // 面板从后台重新可见时立即刷新（隐藏期间定时器跳过重渲染）
+    this.panel.onDidChangeViewState(
+      (e) => {
+        if (e.webviewPanel.visible && !this.disposed) {
+          this.update();
+        }
+      },
+      null,
+      this.disposables
+    );
+
     // Live auto-refresh every 4 seconds while dashboard is open
     this.autoRefreshTimer = setInterval(() => {
       this.update();
@@ -176,6 +187,11 @@ export class DashboardPanel {
     if (this.disposed) {
       return;
     }
+    // 隐藏在后台时跳过重渲染（retainContextWhenHidden 保住了内容），
+    // 重新可见由 onDidChangeViewState 触发立即刷新
+    if (!this.panel.visible) {
+      return;
+    }
     if (this.isUpdating) {
       this.needsUpdate = true;
       return;
@@ -184,10 +200,7 @@ export class DashboardPanel {
     try {
       const status = await this.service.fetchStatus();
       const pricing = this.loadPricing();
-      let totalAccounts = 0;
-      try {
-        totalAccounts = (await this.service.fetchAccountsList()).length;
-      } catch {}
+      const totalAccounts = this.service.countAccounts();
 
       if (this.disposed) {
         return;

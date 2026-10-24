@@ -7,6 +7,7 @@ import { AntigravityStatus } from './types';
 let refreshTimer: NodeJS.Timeout | null = null;
 let currentStatus: AntigravityStatus | null = null;
 let isRefreshing = false;
+let needsRefresh = false;
 
 export function activate(context: vscode.ExtensionContext) {
   const service = new AntigravityService();
@@ -23,8 +24,10 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   const refresh = async (): Promise<void> => {
-    // 定时器间隔可能小于 fetchStatus 耗时（CLI 慢时可达数秒），防止刷新堆叠
+    // 定时器间隔可能小于 fetchStatus 耗时（CLI 慢时可达数秒），防止刷新堆叠；
+    // 进行中到达的刷新不丢弃，结束后补跑一次（配额文件变动事件不丢）
     if (isRefreshing) {
+      needsRefresh = true;
       return;
     }
     isRefreshing = true;
@@ -36,6 +39,10 @@ export function activate(context: vscode.ExtensionContext) {
       console.error('Antigravity Status fetch error:', err);
     } finally {
       isRefreshing = false;
+      if (needsRefresh) {
+        needsRefresh = false;
+        refresh();
+      }
     }
   };
 
