@@ -48,28 +48,41 @@ class AntigravityService {
     lastKnownAccountId = null;
     accountSwitchCallback = null;
     statusChangedCallbacks = [];
-    watchers = [];
+    accountsFileWatcher = null;
+    accountsDirWatcher = null;
+    conversationsWatcher = null;
     lastOnlineRefreshTime = 0;
     isRefreshingOnline = false;
     isSwitchingInternally = false;
     cachedProcessStatus = null;
     conversationDebounceTimer = null;
+    statsCache = null;
+    statsInFlight = null;
     constructor() {
         this.updateConfig();
-        this.startWatchers();
+        this.ensureWatchers();
     }
+    /**
+     * 子进程环境：仅当配置了代理或环境变量存在时注入，
+     * 不再强制硬编码 127.0.0.1:7897（没有本地代理时会导致 CLI 联网全部失败/超时）。
+     */
     getExecEnv() {
+        const proxy = (0, utils_1.getProxyUrl)();
+        if (!proxy) {
+            return { ...process.env };
+        }
         return {
             ...process.env,
-            HTTP_PROXY: process.env.HTTP_PROXY || process.env.http_proxy || 'http://127.0.0.1:7897',
-            HTTPS_PROXY: process.env.HTTPS_PROXY || process.env.https_proxy || 'http://127.0.0.1:7897',
-            http_proxy: process.env.http_proxy || process.env.HTTP_PROXY || 'http://127.0.0.1:7897',
-            https_proxy: process.env.https_proxy || process.env.HTTPS_PROXY || 'http://127.0.0.1:7897',
+            HTTP_PROXY: proxy,
+            HTTPS_PROXY: proxy,
+            http_proxy: proxy,
+            https_proxy: proxy,
         };
     }
     updateConfig() {
         const config = vscode.workspace.getConfiguration('antigravityStatus');
         this.customAgySwitchPath = config.get('agySwitchPath', '');
+        this.statsCache = null; // 配置变化后允许立刻重新拉取
     }
     getAgySwitchExecutable() {
         return (0, utils_1.resolveAgySwitchPath)(this.customAgySwitchPath);
@@ -90,60 +103,53 @@ class AntigravityService {
             }
         }
     }
-    startWatchers() {
+    /**
+     * 挂载文件监听。会在每次 fetchStatus 时懒调用：
+     * 若激活时 ~/.antigravity_tools 尚不存在（后导入账号/装 CLI），也能补挂。
+     */
+    ensureWatchers() {
         const toolsDir = (0, utils_1.getAntigravityToolsDir)();
         const accountsJsonPath = path.join(toolsDir, 'accounts.json');
         const accountsDirPath = path.join(toolsDir, 'accounts');
         const geminiConversationsDir = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
-        // 1. Watch accounts.json (Account Switching)
-        if (fs.existsSync(accountsJsonPath)) {
-            try {
-                const raw = fs.readFileSync(accountsJsonPath, 'utf-8');
-                const data = JSON.parse(raw);
-                this.lastKnownAccountId = data.current_account_id || null;
-            }
-            catch { }
-            try {
-                const w1 = fs.watch(accountsJsonPath, (eventType) => {
-                    if (eventType === 'change') {
-                        setTimeout(() => {
-                            this.checkAccountChange(accountsJsonPath);
-                        }, 200);
-                    }
-                });
-                this.watchers.push(w1);
-            }
-            catch (e) {
-                console.warn('Failed to watch accounts.json:', e);
-            }
+        // 1. accounts.json（账号切换检测）
+        if (!this.accountsFileWatcher && fs.existsSync(accountsJsonPath)) {
+            this.watchAccountsFile(accountsJsonPath);
         }
-        // 2. Watch accounts/ directory (Live quota updates from agy-switch-desktop or background)
-        if (fs.existsSync(accountsDirPath)) {
+        // 2. accounts/ 目录（配额文件被 agy-switch / 桌面版回写）
+        if (!this.accountsDirWatcher && fs.existsSync(accountsDirPath)) {
             try {
-                const w2 = fs.watch(accountsDirPath, (eventType, filename) => {
-                    if (eventType === 'change' || eventType === 'rename') {
+                const w = fs.watch(accountsDirPath, (_eventType, filename) => {
+                    if (!filename || filename.toString().endsWith('.json')) {
                         this.notifyStatusChanged();
                     }
                 });
-                this.watchers.push(w2);
+                w.on('error', () => {
+                    try {
+                        w.close();
+                    }
+                    catch { }
+                    if (this.accountsDirWatcher === w) {
+                        this.accountsDirWatcher = null;
+                    }
+                });
+                this.accountsDirWatcher = w;
             }
             catch (e) {
                 console.warn('Failed to watch accounts directory:', e);
             }
         }
-        // 3. Watch .gemini/antigravity/conversations directory
-        // Any time Antigravity completes a turn/prompt, its DB and WAL files are modified!
-        if (fs.existsSync(geminiConversationsDir)) {
+        // 3. conversations 目录：反重力每完成一轮生成会写 DB/WAL
+        if (!this.conversationsWatcher && fs.existsSync(geminiConversationsDir)) {
             try {
-                const w3 = fs.watch(geminiConversationsDir, (eventType, filename) => {
-                    if (filename && (filename.endsWith('.db') || filename.endsWith('.db-wal'))) {
+                const w = fs.watch(geminiConversationsDir, (_eventType, filename) => {
+                    const name = filename ? filename.toString() : '';
+                    if (name.endsWith('.db') || name.endsWith('.db-wal')) {
                         if (this.conversationDebounceTimer) {
                             clearTimeout(this.conversationDebounceTimer);
                         }
                         this.conversationDebounceTimer = setTimeout(() => {
-                            // Immediately refresh locally (0ms)
                             this.notifyStatusChanged();
-                            // Trigger online quota refresh from Google Cloud via agy-switch in background
                             const config = vscode.workspace.getConfiguration('antigravityStatus');
                             const autoSync = config.get('autoSyncOnlineOnTurn', true);
                             if (autoSync) {
@@ -152,11 +158,75 @@ class AntigravityService {
                         }, 500);
                     }
                 });
-                this.watchers.push(w3);
+                w.on('error', () => {
+                    try {
+                        w.close();
+                    }
+                    catch { }
+                    if (this.conversationsWatcher === w) {
+                        this.conversationsWatcher = null;
+                    }
+                });
+                this.conversationsWatcher = w;
             }
             catch (e) {
                 console.warn('Failed to watch conversations directory:', e);
             }
+        }
+    }
+    /**
+     * 监听 accounts.json。Windows 上很多工具是"写临时文件 + rename 替换"的原子写，
+     * 只听 'change' 会漏事件，且 rename 后旧 inode 失效必须重新挂监听。
+     */
+    watchAccountsFile(accountsJsonPath) {
+        try {
+            if (this.lastKnownAccountId === null) {
+                try {
+                    const data = JSON.parse(fs.readFileSync(accountsJsonPath, 'utf-8'));
+                    this.lastKnownAccountId = data.current_account_id || null;
+                }
+                catch { }
+            }
+            const watcher = fs.watch(accountsJsonPath, (eventType) => {
+                setTimeout(() => {
+                    if (fs.existsSync(accountsJsonPath)) {
+                        this.checkAccountChange(accountsJsonPath);
+                        if (eventType === 'rename') {
+                            // 原子替换后重新挂监听，否则后续切换全部漏检
+                            this.watchAccountsFile(accountsJsonPath);
+                        }
+                    }
+                    else {
+                        if (this.accountsFileWatcher) {
+                            try {
+                                this.accountsFileWatcher.close();
+                            }
+                            catch { }
+                            this.accountsFileWatcher = null;
+                        }
+                    }
+                }, 200);
+            });
+            watcher.on('error', () => {
+                try {
+                    watcher.close();
+                }
+                catch { }
+                if (this.accountsFileWatcher === watcher) {
+                    this.accountsFileWatcher = null;
+                }
+            });
+            if (this.accountsFileWatcher) {
+                try {
+                    this.accountsFileWatcher.close();
+                }
+                catch { }
+            }
+            this.accountsFileWatcher = watcher;
+        }
+        catch (e) {
+            console.warn('Failed to watch accounts.json:', e);
+            this.accountsFileWatcher = null;
         }
     }
     checkAccountChange(accountsJsonPath) {
@@ -172,7 +242,6 @@ class AntigravityService {
                 this.lastKnownAccountId = newId;
                 const matchingAcc = data.accounts?.find((a) => a.id === newId);
                 const email = matchingAcc?.email || '未知账号';
-                // Immediately notify listeners so status bar and dashboard switch data instantly
                 this.notifyStatusChanged();
                 if (this.accountSwitchCallback) {
                     this.accountSwitchCallback(newId, email);
@@ -185,7 +254,7 @@ class AntigravityService {
     }
     async checkAgyProcess() {
         const now = Date.now();
-        if (this.cachedProcessStatus && now - this.cachedProcessStatus.timestamp < 2000) {
+        if (this.cachedProcessStatus && now - this.cachedProcessStatus.timestamp < 8000) {
             return {
                 running: this.cachedProcessStatus.running,
                 pid: this.cachedProcessStatus.pid,
@@ -219,12 +288,44 @@ class AntigravityService {
         return { running: false, pid: null };
     }
     /**
-     * Refreshes the currently active account quota online from Google servers via agy-switch
-     * Runs in the background without blocking the UI
+     * agy-switch stats 的本地缓存轮询：
+     * 状态栏每 5 秒、仪表盘每 4 秒各刷一次，不再每次都拉起一个子进程。
+     */
+    async fetchStatsCached() {
+        const config = vscode.workspace.getConfiguration('antigravityStatus');
+        const ttlMs = Math.max(1, config.get('statsCacheSeconds', 3)) * 1000;
+        if (this.statsCache && Date.now() - this.statsCache.ts < ttlMs) {
+            return this.statsCache.data;
+        }
+        if (this.statsInFlight) {
+            return this.statsInFlight;
+        }
+        const executable = this.getAgySwitchExecutable();
+        if (!executable) {
+            return null;
+        }
+        this.statsInFlight = execFileAsync(executable, ['stats', '--json'], {
+            timeout: 8000,
+            encoding: 'utf-8',
+            maxBuffer: 10 * 1024 * 1024,
+        })
+            .then(({ stdout }) => JSON.parse(stdout))
+            .catch((e) => {
+            console.warn('stats fetch failed:', e?.message || e);
+            return null;
+        })
+            .finally(() => {
+            this.statsInFlight = null;
+        });
+        const data = await this.statsInFlight;
+        this.statsCache = { data, ts: Date.now() };
+        return data;
+    }
+    /**
+     * 通过 agy-switch 在后台向 Google 云端刷新当前账号配额
      */
     async refreshCurrentAccountOnline() {
         const now = Date.now();
-        // Throttle to avoid calling Google API more than once every 3 seconds
         if (this.isRefreshingOnline || now - this.lastOnlineRefreshTime < 3000) {
             return;
         }
@@ -241,7 +342,6 @@ class AntigravityService {
                 encoding: 'utf-8',
                 env: this.getExecEnv(),
             });
-            // agy-switch updates accounts/<id>.json on disk, which fires the accounts directory watcher!
         }
         catch (e) {
             console.warn('Online quota refresh warning:', e);
@@ -267,12 +367,13 @@ class AntigravityService {
         return null;
     }
     async fetchStatus() {
+        // 懒挂载：目录可能晚于插件激活才创建
+        this.ensureWatchers();
         const processPromise = this.checkAgyProcess();
         const executable = this.getAgySwitchExecutable();
         let account = null;
-        let stats = null;
         let error = null;
-        // 1. Try reading directly from .antigravity_tools (0ms, 100% accurate & fresh)
+        // 1. 直接读 .antigravity_tools（本地磁盘，快且新鲜）
         const toolsDir = (0, utils_1.getAntigravityToolsDir)();
         const accountsJsonPath = path.join(toolsDir, 'accounts.json');
         if (fs.existsSync(accountsJsonPath)) {
@@ -301,7 +402,7 @@ class AntigravityService {
                 console.warn('Direct accounts.json read warning:', e);
             }
         }
-        // 2. Fallback to CLI if direct read didn't give full quota
+        // 2. 本地读不到配额时回退 CLI
         if (!account?.quota?.quota_groups && executable) {
             try {
                 const { stdout } = await execFileAsync(executable, ['quota', '--json'], {
@@ -320,7 +421,6 @@ class AntigravityService {
                 }
             }
             catch {
-                // Fallback to agy-switch current
                 try {
                     const { stdout } = await execFileAsync(executable, ['current', '--json'], {
                         timeout: 4000,
@@ -336,26 +436,12 @@ class AntigravityService {
                 }
             }
         }
-        // 3. Fetch token stats via CLI
-        let statsPromise = Promise.resolve(null);
-        if (executable) {
-            statsPromise = execFileAsync(executable, ['stats', '--json'], {
-                timeout: 4000,
-                encoding: 'utf-8',
-            })
-                .then(({ stdout }) => JSON.parse(stdout))
-                .catch((e) => {
-                if (!error && !account) {
-                    error = `获取 Token 消耗统计失败: ${e.message || String(e)}`;
-                }
-                return null;
-            });
-        }
-        const [{ running: isAgyRunning, pid: agyPid }, fetchedStats] = await Promise.all([
+        // 3. Token 统计（带缓存）
+        const statsPromise = this.fetchStatsCached();
+        const [{ running: isAgyRunning, pid: agyPid }, stats] = await Promise.all([
             processPromise,
             statsPromise,
         ]);
-        stats = fetchedStats;
         return {
             account,
             stats,
@@ -421,7 +507,6 @@ class AntigravityService {
                 await execFileAsync(executable, ['switch', accountIdOrEmail, '--target', 'ide', '--json'], { timeout: 8000, encoding: 'utf-8', env: this.getExecEnv() });
             }
             catch { }
-            // Immediately re-read accounts.json to update lastKnownAccountId
             const toolsDir = (0, utils_1.getAntigravityToolsDir)();
             const accountsJsonPath = path.join(toolsDir, 'accounts.json');
             if (fs.existsSync(accountsJsonPath)) {
@@ -432,7 +517,6 @@ class AntigravityService {
                 }
                 catch { }
             }
-            // Online quota sync for new account
             const newId = this.getCurrentAccountId();
             if (newId) {
                 try {
@@ -444,9 +528,7 @@ class AntigravityService {
                 }
                 catch { }
             }
-            // Restart agy.exe backend so it picks up the new token
             await this.restartAgyBackend();
-            // Instantly trigger UI refresh
             this.notifyStatusChanged();
             return {
                 success: true,
@@ -463,6 +545,7 @@ class AntigravityService {
         }
     }
     async restartAgyBackend() {
+        this.cachedProcessStatus = null; // 立即失效缓存，避免显示过期进程状态
         try {
             if (process.platform === 'win32') {
                 await execAsync('taskkill /F /IM agy.exe');
@@ -476,9 +559,14 @@ class AntigravityService {
             };
         }
         catch (err) {
+            const msg = err?.message || String(err) || '';
+            // taskkill 找不到进程时返回非零退出码，这不是错误
+            if (/128|not found|找不到|没有/i.test(msg)) {
+                return { success: true, message: 'agy.exe 未在运行，无需终止。' };
+            }
             return {
                 success: false,
-                message: `终止进程失败或进程未运行: ${err.message || String(err)}`,
+                message: `终止进程失败: ${msg}`,
             };
         }
     }
@@ -514,10 +602,10 @@ class AntigravityService {
             },
             quota: null,
         };
-        // 1. Write detail file
+        // 1. 写账号详情文件
         const detailPath = path.join(accountsDir, `${id}.json`);
         fs.writeFileSync(detailPath, JSON.stringify(accountDetail, null, 2), 'utf-8');
-        // 2. Update accounts.json
+        // 2. 更新 accounts.json
         let accountsData = { version: '2.0', accounts: [] };
         if (fs.existsSync(accountsJsonPath)) {
             try {
@@ -530,21 +618,30 @@ class AntigravityService {
         }
         const existingIndex = accountsData.accounts.findIndex((a) => a.email === email.trim());
         if (existingIndex >= 0) {
+            const oldId = accountsData.accounts[existingIndex].id;
+            // 同邮箱替换：清理旧详情文件，避免残留失效凭据
+            if (oldId && oldId !== id) {
+                try {
+                    fs.unlinkSync(path.join(accountsDir, `${oldId}.json`));
+                }
+                catch { }
+            }
             accountsData.accounts[existingIndex].id = id;
+            accountsData.accounts[existingIndex].name = finalName;
             accountsData.accounts[existingIndex].last_used = now;
         }
         else {
             accountsData.accounts.push({
                 id,
                 email: email.trim(),
-                name: email.trim().split('@')[0],
+                name: finalName,
                 disabled: false,
                 created_at: now,
                 last_used: now,
             });
         }
         fs.writeFileSync(accountsJsonPath, JSON.stringify(accountsData, null, 2), 'utf-8');
-        // 3. Trigger quota refresh in background if agy-switch is present
+        // 3. 后台触发配额刷新
         const executable = this.getAgySwitchExecutable();
         if (executable) {
             try {
@@ -570,13 +667,17 @@ class AntigravityService {
             clearTimeout(this.conversationDebounceTimer);
             this.conversationDebounceTimer = null;
         }
-        for (const w of this.watchers) {
-            try {
-                w.close();
+        for (const w of [this.accountsFileWatcher, this.accountsDirWatcher, this.conversationsWatcher]) {
+            if (w) {
+                try {
+                    w.close();
+                }
+                catch { }
             }
-            catch { }
         }
-        this.watchers = [];
+        this.accountsFileWatcher = null;
+        this.accountsDirWatcher = null;
+        this.conversationsWatcher = null;
     }
 }
 exports.AntigravityService = AntigravityService;

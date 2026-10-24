@@ -41,6 +41,7 @@ const statusBar_1 = require("./statusBar");
 const commands_1 = require("./commands");
 let refreshTimer = null;
 let currentStatus = null;
+let isRefreshing = false;
 function activate(context) {
     const service = new service_1.AntigravityService();
     const statusBar = new statusBar_1.StatusBarController();
@@ -55,6 +56,11 @@ function activate(context) {
         }, 1200);
     }
     const refresh = async () => {
+        // 定时器间隔可能小于 fetchStatus 耗时（CLI 慢时可达数秒），防止刷新堆叠
+        if (isRefreshing) {
+            return;
+        }
+        isRefreshing = true;
         try {
             const status = await service.fetchStatus();
             currentStatus = status;
@@ -62,6 +68,9 @@ function activate(context) {
         }
         catch (err) {
             console.error('Antigravity Status fetch error:', err);
+        }
+        finally {
+            isRefreshing = false;
         }
     };
     const commandController = new commands_1.CommandController(context, service, refresh, () => currentStatus);

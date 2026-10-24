@@ -38,6 +38,48 @@ const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const utils_1 = require("./utils");
+const RANGE_DEFS = [
+    { key: 'today', label: '今天' },
+    { key: 'yesterday', label: '昨天' },
+    { key: '3d', label: '近 3 天' },
+    { key: '7d', label: '近 7 天' },
+    { key: '30d', label: '近 30 天' },
+];
+function rangeBlock(stats, key) {
+    if (!stats)
+        return null;
+    switch (key) {
+        case 'today':
+            return stats.today ?? null;
+        case 'yesterday':
+            return stats.yesterday ?? null;
+        case '3d':
+            return stats.last_3_days ?? null;
+        case '7d':
+            return stats.last_7_days ?? null;
+        case '30d':
+            return stats.last_30_days ?? null;
+    }
+}
+function rangeModels(stats, key) {
+    if (!stats)
+        return [];
+    switch (key) {
+        case 'today':
+            return stats.by_model_today ?? [];
+        case 'yesterday':
+            return stats.by_model_yesterday ?? [];
+        case '3d':
+            return stats.by_model_3_days ?? [];
+        case '7d':
+            return stats.by_model_7_days ?? [];
+        case '30d':
+            return stats.by_model ?? [];
+    }
+}
+function rangeLabelOf(key) {
+    return RANGE_DEFS.find((r) => r.key === key)?.label || '';
+}
 class DashboardPanel {
     service;
     onReloadRequested;
@@ -48,6 +90,11 @@ class DashboardPanel {
     panel;
     disposables = [];
     autoRefreshTimer = null;
+    currentRange = 'today';
+    isUpdating = false;
+    needsUpdate = false;
+    disposed = false;
+    lastHtml = null;
     constructor(panel, service, onReloadRequested, onRestartBackendRequested, onSwitchAccountRequested, onImportAccountRequested) {
         this.service = service;
         this.onReloadRequested = onReloadRequested;
@@ -77,6 +124,12 @@ class DashboardPanel {
                     await this.onImportAccountRequested();
                     await this.update();
                     break;
+                case 'setRange':
+                    if (RANGE_DEFS.some((r) => r.key === message.range)) {
+                        this.currentRange = message.range;
+                        await this.update();
+                    }
+                    break;
             }
         }, null, this.disposables);
         this.update();
@@ -101,11 +154,47 @@ class DashboardPanel {
         DashboardPanel.currentPanel = new DashboardPanel(panel, service, onReloadRequested, onRestartBackendRequested, onSwitchAccountRequested, onImportAccountRequested);
         return DashboardPanel.currentPanel;
     }
+    /**
+     * 串行化更新：避免 4 秒定时器与用户操作触发的更新互相竞态，
+     * 且数据未变化时不重写 html（防止悬停/滚动被反复重置）。
+     * 更新期间到达的请求（如切换统计范围）不丢弃，结束后补跑一次。
+     */
     async update() {
-        const status = await this.service.fetchStatus();
-        const pricing = this.loadPricing();
-        const accounts = await this.service.fetchAccountsList();
-        this.panel.webview.html = this.renderHtml(status, pricing, accounts.length);
+        if (this.disposed) {
+            return;
+        }
+        if (this.isUpdating) {
+            this.needsUpdate = true;
+            return;
+        }
+        this.isUpdating = true;
+        try {
+            const status = await this.service.fetchStatus();
+            const pricing = this.loadPricing();
+            let totalAccounts = 0;
+            try {
+                totalAccounts = (await this.service.fetchAccountsList()).length;
+            }
+            catch { }
+            if (this.disposed) {
+                return;
+            }
+            const html = this.renderHtml(status, pricing, totalAccounts);
+            if (html !== this.lastHtml) {
+                this.panel.webview.html = html;
+                this.lastHtml = html;
+            }
+        }
+        catch (err) {
+            console.warn('Dashboard update error:', err);
+        }
+        finally {
+            this.isUpdating = false;
+            if (this.needsUpdate && !this.disposed) {
+                this.needsUpdate = false;
+                this.update();
+            }
+        }
     }
     loadPricing() {
         const toolsDir = (0, utils_1.getAntigravityToolsDir)();
@@ -127,109 +216,255 @@ class DashboardPanel {
         }
         return result;
     }
+    normalizeModelName(s) {
+        return s
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, ' ')
+            .trim();
+    }
     calculateCost(model, input, output, cached, pricing) {
         const lower = model.toLowerCase();
         let price = pricing[lower];
         if (!price) {
-            const key = Object.keys(pricing).find((k) => lower.includes(k) || k.includes(lower));
-            price = key ? pricing[key] : { input: 0.75, output: 3.75, cached: 0.075 };
+            // 归一化分隔符后再匹配：定价表键是 "gemini-4-argon"，
+            // 而统计里的模型名是 "Gemini 4 Argon (High)"，直接 includes 永远匹配不上
+            const nLower = this.normalizeModelName(lower);
+            const key = Object.keys(pricing).find((k) => {
+                const nk = this.normalizeModelName(k);
+                if (!nk)
+                    return false;
+                return nLower.includes(nk) || nk.includes(nLower);
+            });
+            price = key
+                ? pricing[key]
+                : { input: 0.75, output: 3.75, cached: 0.075 };
         }
         return ((input / 1_000_000) * price.input +
             (output / 1_000_000) * price.output +
             (cached / 1_000_000) * price.cached);
     }
     renderHtml(status, pricing, totalAccounts) {
-        const today = status.stats?.today || {
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_tokens: 0,
-            total_tokens: 0,
-            request_count: 0,
-        };
-        const cacheHitRate = today.input_tokens + today.cached_tokens > 0
-            ? ((today.cached_tokens / (today.input_tokens + today.cached_tokens)) * 100).toFixed(1)
+        const rangeKey = this.currentRange;
+        const rangeLabel = rangeLabelOf(rangeKey);
+        const block = rangeBlock(status.stats, rangeKey) ||
+            {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                total_tokens: 0,
+                request_count: 0,
+            };
+        const cacheHitRate = block.input_tokens + block.cached_tokens > 0
+            ? ((block.cached_tokens / (block.input_tokens + block.cached_tokens)) * 100).toFixed(1)
             : '0.0';
         const perf = status.stats?.recent_performance || {
             first_text_seconds: 0,
             body_tokens_per_second: 0,
         };
+        // 模型明细与费用（按当前范围）
         let totalCost = 0;
-        const modelDetails = (status.stats?.by_model_today || []).map((m) => {
+        const modelDetails = rangeModels(status.stats, rangeKey).map((m) => {
             const cost = this.calculateCost(m.model, m.input_tokens, m.output_tokens, m.cached_tokens, pricing);
             totalCost += cost;
             return { ...m, cost };
         });
-        if (modelDetails.length === 0 && today.total_tokens > 0) {
-            totalCost = this.calculateCost('gemini-3.8-flash-n', today.input_tokens, today.output_tokens, today.cached_tokens, pricing);
-        }
-        let fiveHourRemaining = 1;
-        let weeklyRemaining = 1;
-        if (status.account?.quota?.quota_groups) {
-            for (const g of status.account.quota.quota_groups) {
-                if (g.display_name.includes('Gemini')) {
-                    for (const b of g.buckets) {
-                        if (b.window === '5h')
-                            fiveHourRemaining = b.remaining_fraction;
-                        if (b.window === 'weekly')
-                            weeklyRemaining = b.remaining_fraction;
-                    }
-                }
-            }
-        }
-        const fiveHourUsed = Math.max(0, Math.min(100, Math.round((1 - fiveHourRemaining) * 100)));
-        const weeklyUsed = Math.max(0, Math.min(100, Math.round((1 - weeklyRemaining) * 100)));
-        const avgInputTokens = today.request_count > 0
-            ? (0, utils_1.formatTokens)(Math.round((today.input_tokens + today.cached_tokens) / today.request_count))
+        const avgInputTokens = block.request_count > 0
+            ? (0, utils_1.formatTokens)(Math.round((block.input_tokens + block.cached_tokens) / block.request_count))
             : '0';
-        // Hourly bar chart data
-        const hourlyData = status.stats?.hourly || [];
-        const hours = ['00:00', '03:00', '06:00', '09:00', '12:00', '15:00', '18:00', '21:00', '23:00'];
-        const maxHourlyTotal = Math.max(...hourlyData.map((h) => h.total_tokens || 0), 1);
-        const hourlyBarsHtml = hours
-            .map((hLabel, idx) => {
-            const match = hourlyData.find((h) => h.hour && h.hour.includes(hLabel.split(':')[0]));
-            const count = match ? match.total_tokens : idx >= 3 && idx <= 5 ? today.total_tokens * 0.25 : 0;
-            const heightPct = Math.max(6, Math.min(100, Math.round((count / (maxHourlyTotal || today.total_tokens || 1)) * 100)));
-            const totalStr = (0, utils_1.formatTokens)(count);
-            return `
-          <div class="bar-col" title="${hLabel}: ${totalStr} Token">
-            <div class="bar-tooltip">${totalStr}</div>
-            <div class="bar-wrapper">
-              <div class="bar-fill" style="height: ${heightPct}%;"></div>
+        // ---- 配额族（Gemini / Gemini 4 / Claude-GPT）----
+        const families = (0, utils_1.extractQuotaFamilies)(status.account?.quota?.quota_groups);
+        const gemini4 = families.find((f) => f.key === 'gemini-4') || null;
+        // Gemini 4 用量（当前 Google 未提供 G4 独立配额时的可见指标）
+        const g4ModelsDetail = modelDetails.filter((m) => (0, utils_1.isGemini4ModelName)(m.model));
+        const g4UsageTokens = g4ModelsDetail.reduce((s, m) => s + m.total_tokens, 0);
+        const g4UsageReq = g4ModelsDetail.reduce((s, m) => s + m.request_count, 0);
+        const g4UsageCost = g4ModelsDetail.reduce((s, m) => s + m.cost, 0);
+        const g4UsageShare = g4UsageTokens > 0 && block.total_tokens > 0
+            ? ((g4UsageTokens / block.total_tokens) * 100).toFixed(1)
+            : null;
+        const showG4Card = !!gemini4 || g4UsageTokens > 0;
+        const pct = (f) => f === null || f === undefined ? '--' : (0, utils_1.formatPercent)(f);
+        const usedPct = (f) => f === null || f === undefined
+            ? 0
+            : Math.max(0, Math.min(100, Math.round((1 - f) * 100)));
+        const quotaRowsHtml = families.length
+            ? families
+                .map((f) => `
+            <div class="progress-row">
+              <span>${(0, utils_1.escapeHtml)(f.displayName)} 5h:</span>
+              <span><strong>${pct(f.fiveHour)}</strong></span>
             </div>
-            <div class="bar-label">${hLabel}</div>
-          </div>
-        `;
-        })
-            .join('');
-        const modelRowsHtml = modelDetails.length > 0
-            ? modelDetails
-                .map((m) => `
-            <tr>
-              <td><span class="dot-indicator"></span> <strong>${m.model}</strong></td>
-              <td class="text-cost">$${m.cost.toFixed(2)}</td>
-              <td><strong>${m.total_tokens.toLocaleString()}</strong></td>
-              <td>${m.input_tokens.toLocaleString()}</td>
-              <td>${m.output_tokens.toLocaleString()}</td>
-              <td>${m.request_count.toLocaleString()}</td>
-            </tr>
+            <div class="progress-bar">
+              <div class="progress-fill-cyan" style="width: ${usedPct(f.fiveHour)}%;"></div>
+            </div>
+            <div class="progress-row">
+              <span>${(0, utils_1.escapeHtml)(f.displayName)} 周:</span>
+              <span><strong>${pct(f.weekly)}</strong></span>
+            </div>
+            <div class="progress-bar">
+              <div class="progress-fill-amber" style="width: ${usedPct(f.weekly)}%;"></div>
+            </div>
           `)
                 .join('')
-            : `
-          <tr>
-            <td><span class="dot-indicator"></span> <strong>gemini-3.8-flash-n</strong></td>
-            <td class="text-cost">$${totalCost.toFixed(2)}</td>
-            <td><strong>${today.total_tokens.toLocaleString()}</strong></td>
-            <td>${today.input_tokens.toLocaleString()}</td>
-            <td>${today.output_tokens.toLocaleString()}</td>
-            <td>${today.request_count.toLocaleString()}</td>
-          </tr>
+            : '<div class="kpi-sub">暂无配额数据</div>';
+        let g4CardHtml = '';
+        if (showG4Card) {
+            if (gemini4) {
+                // Google 已提供 G4 独立配额组：显示配额进度条，附带用量
+                g4CardHtml = `
+          <div class="kpi-card" style="border-color: rgba(139, 92, 246, 0.45);">
+            <div class="kpi-title">🆕 Gemini 4 额度</div>
+            <div class="progress-group">
+              <div class="progress-row">
+                <span>5小时:</span>
+                <span><strong>${pct(gemini4.fiveHour)}</strong></span>
+              </div>
+              <div class="progress-bar">
+                <div class="progress-fill-cyan" style="width: ${usedPct(gemini4.fiveHour)}%;"></div>
+              </div>
+              <div class="progress-row">
+                <span>周限额:</span>
+                <span><strong>${pct(gemini4.weekly)}</strong></span>
+              </div>
+              <div class="progress-bar">
+                <div class="progress-fill-amber" style="width: ${usedPct(gemini4.weekly)}%;"></div>
+              </div>
+            </div>
+            <div class="kpi-sub">${g4UsageTokens > 0
+                    ? `${rangeLabel}用量 ${(0, utils_1.formatTokens)(g4UsageTokens)}${g4UsageShare !== null ? ` (${g4UsageShare}%)` : ''} · $${g4UsageCost.toFixed(2)}`
+                    : '独立配额组'}</div>
+          </div>
         `;
+            }
+            else {
+                // 暂无独立配额组：显示 G4 用量，并注明额度计入 Gemini 组
+                g4CardHtml = `
+          <div class="kpi-card" style="border-color: rgba(139, 92, 246, 0.45);">
+            <div class="kpi-title">🆕 Gemini 4 用量</div>
+            <div class="kpi-value">${(0, utils_1.formatTokens)(g4UsageTokens)}</div>
+            <div class="kpi-sub">${rangeLabel} · 占总用量 ${g4UsageShare !== null ? `${g4UsageShare}%` : '--'} · ${g4UsageReq.toLocaleString()} 次请求 · $${g4UsageCost.toFixed(2)}</div>
+            <div class="kpi-sub" style="margin-top:4px;">额度暂计入 Gemini 组（Google 未提供 G4 独立配额，开放后此处自动显示）</div>
+          </div>
+        `;
+            }
+        }
+        // ---- 柱状图：真实数据 ----
+        // 今天/昨天 → hourly（按本地日期过滤）；3/7/30 天 → daily
+        let barEntries = [];
+        if (rangeKey === 'today' || rangeKey === 'yesterday') {
+            const dateStr = (0, utils_1.localDateStr)(rangeKey === 'yesterday' ? -1 : 0);
+            barEntries = (status.stats?.hourly || [])
+                .filter((h) => h.hour && h.hour.startsWith(dateStr))
+                .map((h) => ({ label: h.hour.slice(11), total_tokens: h.total_tokens || 0 }));
+        }
+        else {
+            const n = rangeKey === '3d' ? 3 : rangeKey === '7d' ? 7 : 30;
+            barEntries = (status.stats?.daily || [])
+                .slice(-n)
+                .map((d) => ({ label: d.date.slice(5), total_tokens: d.total_tokens || 0 }));
+        }
+        const maxBarTotal = Math.max(...barEntries.map((b) => b.total_tokens), 1);
+        const barGap = barEntries.length > 12 ? '4px' : '14px';
+        const barsHtml = barEntries.length
+            ? barEntries
+                .map((b) => {
+                const heightPct = Math.max(6, Math.min(100, Math.round((b.total_tokens / maxBarTotal) * 100)));
+                const totalStr = (0, utils_1.formatTokens)(b.total_tokens);
+                return `
+              <div class="bar-col" title="${(0, utils_1.escapeHtml)(b.label)}: ${totalStr} Token">
+                <div class="bar-tooltip">${totalStr}</div>
+                <div class="bar-wrapper">
+                  <div class="bar-fill" style="height: ${heightPct}%;"></div>
+                </div>
+                <div class="bar-label">${(0, utils_1.escapeHtml)(b.label)}</div>
+              </div>
+            `;
+            })
+                .join('')
+            : '<div class="empty-chart">该时段暂无生成记录</div>';
+        const chartTitle = rangeKey === 'today' || rangeKey === 'yesterday'
+            ? `📈 ${rangeLabel} · 每小时 Token 生成`
+            : `📈 ${rangeLabel} · 每日 Token 生成`;
+        // ---- 模型环形图：真实 by_model 数据 ----
+        const palette = [
+            '#00c5ff',
+            '#3b82f6',
+            '#8b5cf6',
+            '#10b981',
+            '#f59e0b',
+            '#ef4444',
+            '#ec4899',
+            '#14b8a6',
+        ];
+        const donutModels = [...modelDetails].sort((a, b) => b.total_tokens - a.total_tokens);
+        const donutTotalTokens = donutModels.reduce((s, m) => s + m.total_tokens, 0);
+        let donutGradient = 'conic-gradient(#1d283f 0% 100%)';
+        if (donutModels.length === 1) {
+            donutGradient = `conic-gradient(${palette[0]} 0% 100%)`;
+        }
+        else if (donutModels.length > 1 && donutTotalTokens > 0) {
+            let acc = 0;
+            const stops = [];
+            donutModels.forEach((m, i) => {
+                const share = (m.total_tokens / donutTotalTokens) * 100;
+                const from = acc;
+                acc += share;
+                stops.push(`${palette[i % palette.length]} ${from.toFixed(2)}% ${acc.toFixed(2)}%`);
+            });
+            donutGradient = `conic-gradient(${stops.join(', ')})`;
+        }
+        const donutLegendHtml = donutModels.length
+            ? donutModels
+                .slice(0, 6)
+                .map((m, i) => {
+                const share = donutTotalTokens > 0
+                    ? ((m.total_tokens / donutTotalTokens) * 100).toFixed(1)
+                    : '0.0';
+                return `
+            <div style="margin-bottom:6px;">
+              <span class="dot-indicator" style="background-color:${palette[i % palette.length]};"></span>
+              <strong>${(0, utils_1.escapeHtml)(m.model)}</strong>
+              <div style="color:var(--text-muted);font-size:12px;margin-top:2px;">
+                ${(0, utils_1.formatTokens)(m.total_tokens)} Token · ${share}% · $${m.cost.toFixed(2)}
+              </div>
+            </div>
+          `;
+            })
+                .join('')
+            : '<div style="color:var(--text-muted);font-size:13px;">暂无模型明细数据</div>';
+        const modelRowsHtml = modelDetails.length
+            ? modelDetails
+                .map((m) => `
+          <tr>
+            <td><span class="dot-indicator"></span> <strong>${(0, utils_1.escapeHtml)(m.model)}</strong></td>
+            <td class="text-cost">$${m.cost.toFixed(2)}</td>
+            <td><strong>${m.total_tokens.toLocaleString()}</strong></td>
+            <td>${m.input_tokens.toLocaleString()}</td>
+            <td>${m.output_tokens.toLocaleString()}</td>
+            <td>${m.request_count.toLocaleString()}</td>
+          </tr>
+        `)
+                .join('')
+            : `
+        <tr>
+          <td><span class="dot-indicator"></span> <strong>未分类模型</strong></td>
+          <td class="text-cost">$0.00</td>
+          <td><strong>${block.total_tokens.toLocaleString()}</strong></td>
+          <td>${block.input_tokens.toLocaleString()}</td>
+          <td>${block.output_tokens.toLocaleString()}</td>
+          <td>${block.request_count.toLocaleString()}</td>
+        </tr>
+      `;
+        const rangePillsHtml = RANGE_DEFS.map((r) => `<span class="range-pill${r.key === rangeKey ? ' active' : ''}" onclick="setRange('${r.key}')">${r.label}</span>`).join('');
+        const generatedAt = status.stats?.generated_at
+            ? (0, utils_1.formatDateLocal)(new Date(status.stats.generated_at * 1000).toISOString())
+            : '';
         return `
       <!DOCTYPE html>
       <html lang="zh-CN">
       <head>
         <meta charset="UTF-8">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
         <style>
           :root {
             --bg-base: #0b1120;
@@ -352,6 +587,11 @@ class DashboardPanel {
             border-radius: 14px;
             color: var(--text-muted);
             cursor: pointer;
+            user-select: none;
+            transition: all 0.15s;
+          }
+          .range-pill:hover {
+            color: var(--text-main);
           }
           .range-pill.active {
             background: #2563eb;
@@ -359,7 +599,7 @@ class DashboardPanel {
             font-weight: 600;
           }
 
-          /* 10 KPI Cards Grid */
+          /* KPI Cards Grid */
           .kpi-grid {
             display: grid;
             grid-template-columns: repeat(5, 1fr);
@@ -460,17 +700,19 @@ class DashboardPanel {
             font-weight: 600;
           }
 
-          /* Hourly Bar Chart */
+          /* Bar Chart */
           .bar-chart-container {
             height: 170px;
             display: flex;
             align-items: flex-end;
-            gap: 14px;
+            gap: ${barGap};
             padding-bottom: 10px;
             border-bottom: 1px solid var(--border-card);
+            overflow-x: auto;
           }
           .bar-col {
-            flex: 1;
+            flex: 1 0 auto;
+            min-width: 18px;
             height: 100%;
             display: flex;
             flex-direction: column;
@@ -496,9 +738,10 @@ class DashboardPanel {
             box-shadow: 0 0 10px rgba(0, 197, 255, 0.6);
           }
           .bar-label {
-            font-size: 11px;
+            font-size: 10px;
             color: var(--text-muted);
             margin-top: 8px;
+            white-space: nowrap;
           }
           .bar-tooltip {
             position: absolute;
@@ -510,6 +753,13 @@ class DashboardPanel {
             white-space: nowrap;
           }
           .bar-col:hover .bar-tooltip { opacity: 1; }
+          .empty-chart {
+            width: 100%;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 13px;
+            padding-top: 60px;
+          }
 
           /* Donut Chart */
           .donut-layout {
@@ -522,15 +772,25 @@ class DashboardPanel {
             width: 110px;
             height: 110px;
             border-radius: 50%;
-            border: 10px solid var(--cyan-accent);
+            background: ${donutGradient};
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
             box-shadow: 0 0 20px rgba(0, 197, 255, 0.25);
           }
+          .donut-inner {
+            width: 86px;
+            height: 86px;
+            border-radius: 50%;
+            background: var(--bg-card);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+          }
           .donut-cost {
-            font-size: 17px;
+            font-size: 15px;
             font-weight: 700;
             color: #fff;
           }
@@ -538,7 +798,7 @@ class DashboardPanel {
             font-size: 10px;
             color: var(--text-muted);
           }
-          .donut-legend { font-size: 13px; }
+          .donut-legend { font-size: 13px; max-width: 55%; }
           .dot-indicator {
             width: 9px;
             height: 9px;
@@ -575,6 +835,11 @@ class DashboardPanel {
             color: var(--amber-accent);
             font-weight: 600;
           }
+          .footer-note {
+            margin-top: 16px;
+            font-size: 11px;
+            color: #64748b;
+          }
         </style>
       </head>
       <body>
@@ -597,48 +862,44 @@ class DashboardPanel {
         <div class="sub-header">
           <div class="sub-title">
             <h1>⊞ 首页</h1>
-            <div class="sub-desc">AntiGravity 本地 Token 账单 · 当前账号: <span style="color:#fff;font-weight:600;">${status.account?.email || '已连接'}</span></div>
+            <div class="sub-desc">AntiGravity 本地 Token 账单 · 当前账号: <span style="color:#fff;font-weight:600;">${(0, utils_1.escapeHtml)(status.account?.email || '已连接')}</span></div>
           </div>
           <div class="range-selector">
             <span style="color:var(--text-muted);margin-right:4px;">统计范围:</span>
-            <span class="range-pill active">今天</span>
-            <span class="range-pill">昨天</span>
-            <span class="range-pill">近 3 天</span>
-            <span class="range-pill">近 7 天</span>
-            <span class="range-pill">近 30 天</span>
+            ${rangePillsHtml}
           </div>
         </div>
 
-        <!-- 10 KPI Cards -->
+        <!-- KPI Cards -->
         <div class="kpi-grid">
           <div class="kpi-card">
-            <div class="kpi-title">📊 今日总 Token</div>
-            <div class="kpi-value">${(0, utils_1.formatTokens)(today.total_tokens)}</div>
-            <div class="kpi-sub">${today.total_tokens.toLocaleString()} Token</div>
+            <div class="kpi-title">📊 ${rangeLabel}总 Token</div>
+            <div class="kpi-value">${(0, utils_1.formatTokens)(block.total_tokens)}</div>
+            <div class="kpi-sub">${block.total_tokens.toLocaleString()} Token · ${block.request_count.toLocaleString()} 次请求</div>
           </div>
 
           <div class="kpi-card">
             <div class="kpi-title">📥 输入 Token</div>
-            <div class="kpi-value">${(0, utils_1.formatTokens)(today.input_tokens)}</div>
-            <div class="kpi-sub">${today.input_tokens.toLocaleString()} Token</div>
+            <div class="kpi-value">${(0, utils_1.formatTokens)(block.input_tokens)}</div>
+            <div class="kpi-sub">${block.input_tokens.toLocaleString()} Token</div>
           </div>
 
           <div class="kpi-card">
             <div class="kpi-title">📤 输出 Token</div>
-            <div class="kpi-value">${(0, utils_1.formatTokens)(today.output_tokens)}</div>
-            <div class="kpi-sub">${today.output_tokens.toLocaleString()} Token</div>
+            <div class="kpi-value">${(0, utils_1.formatTokens)(block.output_tokens)}</div>
+            <div class="kpi-sub">${block.output_tokens.toLocaleString()} Token</div>
           </div>
 
           <div class="kpi-card">
             <div class="kpi-title">⚡ 缓存命中率</div>
             <div class="kpi-value text-green">${cacheHitRate}%</div>
-            <div class="kpi-sub">输入缓存占比 (省约 ${(0, utils_1.formatTokens)(today.cached_tokens)})</div>
+            <div class="kpi-sub">输入缓存占比 (省约 ${(0, utils_1.formatTokens)(block.cached_tokens)})</div>
           </div>
 
           <div class="kpi-card">
             <div class="kpi-title">💰 API 费用估算</div>
             <div class="kpi-value text-amber">$${totalCost.toFixed(2)}</div>
-            <div class="kpi-sub">${today.request_count.toLocaleString()} 次请求</div>
+            <div class="kpi-sub">${rangeLabel} · ${block.request_count.toLocaleString()} 次请求</div>
           </div>
 
           <div class="kpi-card">
@@ -656,33 +917,22 @@ class DashboardPanel {
           <div class="kpi-card">
             <div class="kpi-title">👥 账号状态</div>
             <div class="kpi-value">${totalAccounts} <span style="font-size:13px;color:var(--text-muted)">个账号</span></div>
-            <div class="kpi-sub">当前激活: ${status.account?.email || '已连接'}</div>
+            <div class="kpi-sub">当前激活: ${(0, utils_1.escapeHtml)(status.account?.email || '已连接')}</div>
           </div>
 
           <div class="kpi-card">
-            <div class="kpi-title">⏳ 综合限度</div>
+            <div class="kpi-title">⏳ 配额剩余 (全部模型组)</div>
             <div class="progress-group">
-              <div class="progress-row">
-                <span>5小时:</span>
-                <span><strong>${fiveHourUsed}%</strong> (剩 ${(0, utils_1.formatPercent)(fiveHourRemaining)})</span>
-              </div>
-              <div class="progress-bar">
-                <div class="progress-fill-cyan" style="width: ${fiveHourUsed}%;"></div>
-              </div>
-              <div class="progress-row">
-                <span>周限额:</span>
-                <span><strong>${weeklyUsed}%</strong> (剩 ${(0, utils_1.formatPercent)(weeklyRemaining)})</span>
-              </div>
-              <div class="progress-bar">
-                <div class="progress-fill-amber" style="width: ${weeklyUsed}%;"></div>
-              </div>
+              ${quotaRowsHtml}
             </div>
           </div>
+
+          ${g4CardHtml}
 
           <div class="kpi-card">
             <div class="kpi-title">📐 平均输入规模</div>
             <div class="kpi-value">${avgInputTokens}</div>
-            <div class="kpi-sub">${today.request_count.toLocaleString()} 次请求, 含缓存输入</div>
+            <div class="kpi-sub">${block.request_count.toLocaleString()} 次请求, 含缓存输入</div>
           </div>
         </div>
 
@@ -690,27 +940,28 @@ class DashboardPanel {
         <div class="charts-row">
           <div class="chart-card">
             <div class="chart-header">
-              <div class="chart-title">📈 今天 - 本地生成记录汇总</div>
-              <div style="font-size:12px;color:var(--text-muted)">用量明细</div>
+              <div class="chart-title">${chartTitle}</div>
+              <div style="font-size:12px;color:var(--text-muted)">真实本地记录</div>
             </div>
             <div class="bar-chart-container">
-              ${hourlyBarsHtml}
+              ${barsHtml}
             </div>
           </div>
 
           <div class="chart-card">
             <div class="chart-header">
-              <div class="chart-title">🎯 模型分布 - 今天本地记录</div>
+              <div class="chart-title">🎯 模型分布 · ${rangeLabel}</div>
               <div style="font-size:12px;color:var(--cyan-accent)">预估费用</div>
             </div>
             <div class="donut-layout">
               <div class="donut-ring">
-                <div class="donut-cost">$${totalCost.toFixed(2)}</div>
-                <div class="donut-label">预估费用</div>
+                <div class="donut-inner">
+                  <div class="donut-cost">$${totalCost.toFixed(2)}</div>
+                  <div class="donut-label">预估费用</div>
+                </div>
               </div>
               <div class="donut-legend">
-                <div><span class="dot-indicator"></span> <strong>gemini-3.8-flash-n</strong></div>
-                <div style="color:var(--text-muted);font-size:12px;margin-top:4px;">$${totalCost.toFixed(2)} (100.0%)</div>
+                ${donutLegendHtml}
               </div>
             </div>
           </div>
@@ -719,7 +970,7 @@ class DashboardPanel {
         <!-- Bottom Table -->
         <div class="table-card">
           <div class="chart-header">
-            <div class="chart-title">📑 模型明细 - 今天输入、输出、缓存和请求次数</div>
+            <div class="chart-title">📑 模型明细 · ${rangeLabel}输入、输出、缓存和请求次数</div>
             <div style="font-size:12px;color:var(--text-muted)">${modelDetails.length || 1} 个模型</div>
           </div>
           <table>
@@ -737,12 +988,16 @@ class DashboardPanel {
               ${modelRowsHtml}
             </tbody>
           </table>
+          <div class="footer-note">数据来源: agy-switch stats 本地统计${generatedAt ? ` · 统计生成于 ${generatedAt}` : ''}</div>
         </div>
 
         <script>
           const vscode = acquireVsCodeApi();
           function postCmd(command) {
             vscode.postMessage({ command });
+          }
+          function setRange(range) {
+            vscode.postMessage({ command: 'setRange', range });
           }
         </script>
       </body>
@@ -754,7 +1009,9 @@ class DashboardPanel {
             clearInterval(this.autoRefreshTimer);
             this.autoRefreshTimer = null;
         }
+        this.disposed = true;
         DashboardPanel.currentPanel = undefined;
+        this.lastHtml = null;
         this.panel.dispose();
         while (this.disposables.length) {
             const x = this.disposables.pop();

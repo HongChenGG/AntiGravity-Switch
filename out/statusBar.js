@@ -54,35 +54,26 @@ class StatusBarController {
             this.statusBarItem.tooltip = new vscode.MarkdownString(`### ⚠️ 反重力状态读取异常\n\n${status.error}\n\n*点击查看操作菜单*`);
             return;
         }
-        // Extract quotas
-        let weeklyGeminiFraction = null;
-        let fiveHourGeminiFraction = null;
-        let weeklyClaudeFraction = null;
-        let fiveHourClaudeFraction = null;
-        const quotaGroups = status.account?.quota?.quota_groups || [];
-        for (const group of quotaGroups) {
-            for (const bucket of group.buckets) {
-                if (group.display_name.includes('Gemini')) {
-                    if (bucket.window === 'weekly') {
-                        weeklyGeminiFraction = bucket.remaining_fraction;
-                    }
-                    else if (bucket.window === '5h') {
-                        fiveHourGeminiFraction = bucket.remaining_fraction;
-                    }
-                }
-                else if (group.display_name.includes('Claude') || group.display_name.includes('GPT')) {
-                    if (bucket.window === 'weekly') {
-                        weeklyClaudeFraction = bucket.remaining_fraction;
-                    }
-                    else if (bucket.window === '5h') {
-                        fiveHourClaudeFraction = bucket.remaining_fraction;
-                    }
-                }
+        // 按配额族归纳（Gemini / Gemini 4 / Claude-GPT），多组不再互相覆盖
+        const families = (0, utils_1.extractQuotaFamilies)(status.account?.quota?.quota_groups);
+        const primary = (0, utils_1.pickPrimaryGeminiFamily)(families);
+        const gemini4 = (0, utils_1.pickGemini4Family)(families);
+        // 模型级兜底：Google 尚未拆分 G4 独立配额组、但 models 里出现 gemini-4 条目时，
+        // 用该模型的剩余百分比展示 G4
+        let g4ModelFraction = null;
+        if (!gemini4 && status.account?.quota?.models?.length) {
+            const g4Model = status.account.quota.models.find((m) => (0, utils_1.isGemini4ModelName)(m.name));
+            if (g4Model) {
+                g4ModelFraction =
+                    g4Model.observed_remaining_fraction ?? g4Model.percentage / 100;
             }
         }
-        // Fallback if no quota groups
-        if (fiveHourGeminiFraction === null && status.account?.quota?.models?.length) {
-            const geminiModel = status.account.quota.models.find((m) => m.quota_bucket_id === 'gemini-5h' || m.name.includes('gemini'));
+        let fiveHourGeminiFraction = primary?.fiveHour ?? null;
+        let weeklyGeminiFraction = primary?.weekly ?? null;
+        // 旧版数据结构兜底：仅有 models 列表时取 Gemini 模型百分比
+        if (fiveHourGeminiFraction === null &&
+            status.account?.quota?.models?.length) {
+            const geminiModel = status.account.quota.models.find((m) => m.name.toLowerCase().includes('gemini'));
             if (geminiModel) {
                 fiveHourGeminiFraction =
                     geminiModel.observed_remaining_fraction ??
@@ -92,44 +83,61 @@ class StatusBarController {
         const todayTokens = (0, utils_1.formatTokens)(status.stats?.today?.total_tokens ?? 0);
         const fiveHourPercentStr = fiveHourGeminiFraction !== null ? (0, utils_1.formatPercent)(fiveHourGeminiFraction) : '--';
         const weeklyPercentStr = weeklyGeminiFraction !== null ? (0, utils_1.formatPercent)(weeklyGeminiFraction) : '--';
-        // Format text - Default prominent 5h limit as user requested
+        // Gemini 4 追加段（仅当与基础 Gemini 并存时；5h/周 顺序与前文一致）
+        // 优先独立配额族；无独立族时回退模型级百分比（仅 5h 数字）
+        const g4Five = gemini4 ? gemini4.fiveHour : g4ModelFraction;
+        const g4Weekly = gemini4 ? gemini4.weekly : null;
+        const g4Compact = primary?.key === 'gemini' && g4Five !== null
+            ? ` | G4 ${(0, utils_1.formatPercent)(g4Five)}${g4Weekly !== null ? `/${(0, utils_1.formatPercent)(g4Weekly)}` : ''}`
+            : '';
+        const g4Full = primary?.key === 'gemini' && (g4Five !== null || g4Weekly !== null)
+            ? ` | G4 5h ${(0, utils_1.formatPercent)(g4Five)} | G4 周 ${(0, utils_1.formatPercent)(g4Weekly)}`
+            : '';
+        // 若只有 Gemini 4 配额组（无基础组），直接以 G4 为主显数据
+        const label = primary?.key === 'gemini-4' ? '反重力G4' : '反重力';
         switch (displayFormat) {
             case 'compact':
-                this.statusBarItem.text = `$(sparkle) 反重力: ${fiveHourPercentStr} (5h)`;
+                this.statusBarItem.text = `$(sparkle) ${label}: ${fiveHourPercentStr} (5h)${g4Compact}`;
                 break;
             case '5h-only':
-                this.statusBarItem.text = `$(sparkle) 反重力: ${fiveHourPercentStr} (5h) | 今日 ${todayTokens}`;
+                this.statusBarItem.text = `$(sparkle) ${label}: ${fiveHourPercentStr} (5h)${g4Compact} | 今日 ${todayTokens}`;
                 break;
             case 'full':
-                this.statusBarItem.text = `$(sparkle) 反重力: 5h ${fiveHourPercentStr} | 周 ${weeklyPercentStr} | 今日 ${todayTokens}`;
+                this.statusBarItem.text = `$(sparkle) ${label}: 5h ${fiveHourPercentStr} | 周 ${weeklyPercentStr}${g4Full} | 今日 ${todayTokens}`;
                 break;
             case 'standard':
             default:
-                // Default standard: 5h limit first + weekly + today tokens
-                this.statusBarItem.text = `$(sparkle) 反重力: ${fiveHourPercentStr} (5h) | 周 ${weeklyPercentStr} | 今日 ${todayTokens}`;
+                this.statusBarItem.text = `$(sparkle) ${label}: ${fiveHourPercentStr} (5h) | 周 ${weeklyPercentStr}${g4Compact} | 今日 ${todayTokens}`;
                 break;
         }
-        // Warning color: based on 5h limit & weekly limit
-        if ((fiveHourGeminiFraction !== null && fiveHourGeminiFraction <= 0.05) ||
-            (weeklyGeminiFraction !== null && weeklyGeminiFraction <= 0.1)) {
+        // 预警配色：基础 Gemini 与 Gemini 4 任一族触线即告警
+        const watched = [];
+        if (primary) {
+            watched.push(primary);
+        }
+        if (gemini4 && primary?.key === 'gemini') {
+            watched.push(gemini4);
+        }
+        const anyLow = watched.some((f) => (f.fiveHour !== null && f.fiveHour <= 0.05) ||
+            (f.weekly !== null && f.weekly <= 0.1));
+        const anyWarn = watched.some((f) => (f.fiveHour !== null && f.fiveHour <= 0.2) ||
+            (f.weekly !== null && f.weekly <= 0.25));
+        if (anyLow) {
             this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
         }
-        else if ((fiveHourGeminiFraction !== null && fiveHourGeminiFraction <= 0.2) ||
-            (weeklyGeminiFraction !== null && weeklyGeminiFraction <= 0.25)) {
+        else if (anyWarn) {
             this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
         }
         else {
             this.statusBarItem.backgroundColor = undefined;
         }
-        // Rich Tooltip
-        this.statusBarItem.tooltip = this.buildTooltip(status);
+        this.statusBarItem.tooltip = this.buildTooltip(status, families);
     }
-    buildTooltip(status) {
+    buildTooltip(status, families) {
         const md = new vscode.MarkdownString('', true);
         md.isTrusted = true;
         md.supportHtml = true;
         md.appendMarkdown('### 🚀 Google Antigravity (反重力) 状态监控\n\n');
-        // Account & Process Info
         const email = status.account?.email || '未登录/未识别';
         const tier = status.account?.quota?.subscription_tier || 'Google AI';
         const processStatus = status.isAgyRunning
@@ -138,6 +146,16 @@ class StatusBarController {
         md.appendMarkdown(`- **当前账号**: \`${email}\`\n`);
         md.appendMarkdown(`- **订阅等级**: \`${tier}\`\n`);
         md.appendMarkdown(`- **核心引擎**: \`agy.exe\` ${processStatus}\n\n`);
+        // 配额族摘要（含 Gemini 4）
+        for (const f of families) {
+            if (f.key === 'claude-gpt') {
+                continue;
+            }
+            md.appendMarkdown(`- **${f.displayName}**: 5h \`${(0, utils_1.formatPercent)(f.fiveHour)}\` · 周 \`${(0, utils_1.formatPercent)(f.weekly)}\`\n`);
+        }
+        if (families.some((f) => f.key !== 'claude-gpt')) {
+            md.appendMarkdown('\n');
+        }
         // Quota details
         md.appendMarkdown('---\n');
         md.appendMarkdown('#### ⏳ 周期限额与配额 (Quotas)\n\n');
@@ -191,7 +209,9 @@ class StatusBarController {
         }
         if (status.stats?.recent_performance) {
             const perf = status.stats.recent_performance;
-            const tps = perf.body_tokens_per_second ? perf.body_tokens_per_second.toFixed(1) : '--';
+            const tps = perf.body_tokens_per_second
+                ? perf.body_tokens_per_second.toFixed(1)
+                : '--';
             const ttft = perf.first_text_seconds ? perf.first_text_seconds.toFixed(2) : '--';
             md.appendMarkdown(`- **生成性能**: \`${tps} tokens/s\` | 首字延迟: \`${ttft}s\`\n`);
         }

@@ -2,7 +2,7 @@
   "name": "antigravity-status-bar",
   "displayName": "Google Antigravity Status & Reload",
   "description": "VS Code 状态栏反重力插件监控：实时展示 5小时配额、周配额、高颜值Token仪表盘，并提供外部切号自动热重载与OAuth Token账号导入",
-  "version": "1.5.0",
+  "version": "1.6.2",
   "publisher": "local-dev",
   "engines": {
     "vscode": "^1.80.0"
@@ -71,6 +71,11 @@
         "category": "Antigravity"
       },
       {
+        "command": "antigravity-status.showDetails",
+        "title": "反重力: 查看状态详情",
+        "category": "Antigravity"
+      },
+      {
         "command": "antigravity-status.reloadWindow",
         "title": "反重力: 重载 VS Code 窗口",
         "category": "Antigravity"
@@ -112,12 +117,24 @@
             "full"
           ],
           "default": "standard",
-          "description": "状态栏文字显示格式: standard (5h配额 + 周配额 + 今日Token), 5h-only (仅5h配额 + 今日Token), compact (仅5h配额), full (详细)"
+          "description": "状态栏文字显示格式: standard (5h配额 + 周配额 + 今日Token), 5h-only (仅5h配额 + 今日Token), compact (仅5h配额), full (详细)。存在 Gemini 4 独立配额组时会自动追加 G4 段"
         },
         "antigravityStatus.autoReloadOnSwitch": {
           "type": "boolean",
           "default": true,
           "description": "当在外部软件切换账号时，是否自动重启核心进程并热重载 VS Code 插件使新账号立即生效 (免手动关闭重新打开 VS Code)"
+        },
+        "antigravityStatus.proxyUrl": {
+          "type": "string",
+          "default": "",
+          "description": "网络代理地址 (如 http://127.0.0.1:7897)。留空则不使用代理；留空时会自动继承环境变量 HTTP_PROXY / HTTPS_PROXY"
+        },
+        "antigravityStatus.statsCacheSeconds": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 300,
+          "description": "Token 统计 (agy-switch stats) 的本地缓存秒数，避免每次刷新都拉起子进程"
         }
       }
     }

@@ -6,6 +6,7 @@ import { AntigravityStatus } from './types';
 
 let refreshTimer: NodeJS.Timeout | null = null;
 let currentStatus: AntigravityStatus | null = null;
+let isRefreshing = false;
 
 export function activate(context: vscode.ExtensionContext) {
   const service = new AntigravityService();
@@ -22,12 +23,19 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   const refresh = async (): Promise<void> => {
+    // 定时器间隔可能小于 fetchStatus 耗时（CLI 慢时可达数秒），防止刷新堆叠
+    if (isRefreshing) {
+      return;
+    }
+    isRefreshing = true;
     try {
       const status = await service.fetchStatus();
       currentStatus = status;
       statusBar.update(status);
     } catch (err: any) {
       console.error('Antigravity Status fetch error:', err);
+    } finally {
+      isRefreshing = false;
     }
   };
 

@@ -42,6 +42,7 @@ const http = __importStar(require("http"));
 const https = __importStar(require("https"));
 const url_1 = require("url");
 const vscode = __importStar(require("vscode"));
+const utils_1 = require("./utils");
 function decodeStr(b64) {
     return Buffer.from(b64, 'base64').toString('utf8');
 }
@@ -50,16 +51,23 @@ exports.ANTIGRAVITY_CLIENT_SECRET = decodeStr('R09DU1BYLUs1OEZXUjQ4NkxkTExKMW1MQ
 function requestGoogleApi(urlStr, postData) {
     return new Promise((resolve, reject) => {
         const url = new url_1.URL(urlStr);
-        const proxyHost = process.env.HTTP_PROXY || process.env.http_proxy || 'http://127.0.0.1:7897';
-        let proxyPort = 7897;
-        let proxyHostname = '127.0.0.1';
-        try {
-            const pUrl = new url_1.URL(proxyHost.startsWith('http') ? proxyHost : `http://${proxyHost}`);
-            proxyHostname = pUrl.hostname;
-            proxyPort = parseInt(pUrl.port, 10) || 7897;
-        }
-        catch { }
-        const tryDirect = () => {
+        let settled = false;
+        const settle = (fn) => {
+            if (!settled) {
+                settled = true;
+                fn();
+            }
+        };
+        const ok = (status, body) => settle(() => {
+            let data = body;
+            try {
+                data = JSON.parse(body);
+            }
+            catch { }
+            resolve({ status: status || 200, data });
+        });
+        const fail = (err) => settle(() => reject(err));
+        const doDirect = () => {
             const req = https.request(urlStr, {
                 method: postData ? 'POST' : 'GET',
                 headers: postData
@@ -68,24 +76,36 @@ function requestGoogleApi(urlStr, postData) {
                         'Content-Length': Buffer.byteLength(postData),
                     }
                     : {},
+                timeout: 15000,
             }, (res) => {
                 let body = '';
                 res.on('data', (d) => (body += d));
-                res.on('end', () => {
-                    try {
-                        resolve({ status: res.statusCode || 200, data: JSON.parse(body) });
-                    }
-                    catch {
-                        resolve({ status: res.statusCode || 200, data: body });
-                    }
-                });
+                res.on('end', () => ok(res.statusCode, body));
             });
-            req.on('error', reject);
+            req.on('error', fail);
+            req.on('timeout', () => req.destroy(new Error('请求 Google 超时 (直连)')));
             if (postData)
                 req.write(postData);
             req.end();
         };
-        // First attempt CONNECT tunnel through proxy
+        // 代理地址来自用户配置或环境变量；不再硬编码 127.0.0.1:7897，
+        // 否则未开代理的用户每个请求都要先等一次 CONNECT 失败。
+        const proxyUrl = (0, utils_1.getProxyUrl)();
+        if (!proxyUrl) {
+            doDirect();
+            return;
+        }
+        let proxyHostname = '127.0.0.1';
+        let proxyPort = 8080;
+        try {
+            const pUrl = new url_1.URL(proxyUrl.startsWith('http') ? proxyUrl : `http://${proxyUrl}`);
+            proxyHostname = pUrl.hostname;
+            proxyPort = parseInt(pUrl.port, 10) || 8080;
+        }
+        catch {
+            doDirect();
+            return;
+        }
         const proxyReq = http.request({
             host: proxyHostname,
             port: proxyPort,
@@ -94,6 +114,11 @@ function requestGoogleApi(urlStr, postData) {
             timeout: 5000,
         });
         proxyReq.on('connect', (res, socket) => {
+            if (res.statusCode !== 200) {
+                proxyReq.destroy();
+                doDirect();
+                return;
+            }
             const tlsReq = https.request({
                 host: url.hostname,
                 port: 443,
@@ -110,31 +135,30 @@ function requestGoogleApi(urlStr, postData) {
                 },
                 socket: socket,
                 agent: false,
+                timeout: 15000,
             }, (tlsRes) => {
                 let body = '';
                 tlsRes.on('data', (d) => (body += d));
-                tlsRes.on('end', () => {
-                    try {
-                        resolve({ status: tlsRes.statusCode || 200, data: JSON.parse(body) });
-                    }
-                    catch {
-                        resolve({ status: tlsRes.statusCode || 200, data: body });
-                    }
-                });
+                tlsRes.on('end', () => ok(tlsRes.statusCode, body));
             });
             tlsReq.on('error', () => {
-                tryDirect();
+                try {
+                    socket.destroy();
+                }
+                catch { }
+                doDirect();
             });
+            tlsReq.on('timeout', () => tlsReq.destroy(new Error('请求 Google 超时 (代理)')));
             if (postData)
                 tlsReq.write(postData);
             tlsReq.end();
         });
         proxyReq.on('error', () => {
-            tryDirect();
+            doDirect();
         });
         proxyReq.on('timeout', () => {
             proxyReq.destroy();
-            tryDirect();
+            doDirect();
         });
         proxyReq.end();
     });
@@ -186,8 +210,14 @@ async function resolveTokenInfo(rawInput) {
     const trimmed = rawInput.trim();
     // 1. JSON object format
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        let parsed = null;
         try {
-            const parsed = JSON.parse(trimmed);
+            parsed = JSON.parse(trimmed);
+        }
+        catch {
+            // 不是合法 JSON，按裸 Token 字符串继续处理
+        }
+        if (parsed && typeof parsed === 'object') {
             const tokenObj = parsed.token || parsed;
             const refreshToken = tokenObj.refresh_token || parsed.refresh_token || '';
             const accessToken = tokenObj.access_token || parsed.access_token || '';
@@ -219,9 +249,11 @@ async function resolveTokenInfo(rawInput) {
                     name: name || (email ? email.split('@')[0] : 'User'),
                 };
             }
-        }
-        catch {
-            // not valid json, proceed to token string
+            // 合法 JSON 但缺 refresh_token：直接报错，
+            // 不能把整段 JSON 当成裸 Token 拿去 Google 换取并写入账号池
+            throw new Error(accessToken
+                ? 'JSON 凭据中只有 access_token（1 小时就过期），缺少 refresh_token，无法导入。'
+                : 'JSON 凭据中未找到 refresh_token 字段。');
         }
     }
     // 2. Direct Refresh Token (starts with 1// or 40+ chars)
@@ -249,6 +281,32 @@ async function resolveTokenInfo(rawInput) {
 /**
  * Launch system browser and authenticate with Google OAuth loopback flow
  */
+function respondPage(res, status, icon, title, message) {
+    try {
+        res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AntiGravity 授权</title>
+  <style>
+    body { background: #0b1120; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #121929; border: 1px solid #1d283f; padding: 48px; border-radius: 16px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.5); max-width: 450px; }
+    h1 { color: #10b981; font-size: 24px; margin-bottom: 12px; }
+    p { color: #94a3b8; font-size: 15px; line-height: 1.6; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="font-size: 48px; margin-bottom: 16px;">${icon}</div>
+    <h1>${title}</h1>
+    <p>${message}</p>
+  </div>
+</body>
+</html>`);
+    }
+    catch { }
+}
 function loginWithGoogleBrowser() {
     return new Promise((resolve, reject) => {
         let resolved = false;
@@ -262,8 +320,7 @@ function loginWithGoogleBrowser() {
                     const code = reqUrl.searchParams.get('code');
                     const error = reqUrl.searchParams.get('error');
                     if (error) {
-                        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-                        res.end(`<!DOCTYPE html><html><body style="background:#0b1120;color:#f87171;font-family:sans-serif;text-align:center;padding:50px;"><h2>授权失败</h2><p>${error}</p></body></html>`);
+                        respondPage(res, 400, '❌', '授权失败', error);
                         if (!resolved) {
                             resolved = true;
                             server.close();
@@ -271,84 +328,76 @@ function loginWithGoogleBrowser() {
                         }
                         return;
                     }
-                    if (code) {
-                        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                        res.end(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>AntiGravity 授权成功</title>
-  <style>
-    body { background: #0b1120; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    .card { background: #121929; border: 1px solid #1d283f; padding: 48px; border-radius: 16px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.5); max-width: 450px; }
-    h1 { color: #10b981; font-size: 24px; margin-bottom: 12px; }
-    p { color: #94a3b8; font-size: 15px; line-height: 1.6; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div style="font-size: 48px; margin-bottom: 16px;">🚀</div>
-    <h1>Google 账号授权成功！</h1>
-    <p>凭据已成功同步至 AntiGravity 账号池。<br>您可以关闭此浏览器窗口并返回 VS Code 开始编码。</p>
-  </div>
-</body>
-</html>`);
-                        if (!resolved) {
-                            resolved = true;
+                    if (code && !resolved) {
+                        resolved = true;
+                        try {
                             server.close();
-                            try {
-                                const redirectUri = `http://127.0.0.1:${currentPort}/oauth-callback`;
-                                const params = new url_1.URLSearchParams({
-                                    client_id: exports.ANTIGRAVITY_CLIENT_ID,
-                                    client_secret: exports.ANTIGRAVITY_CLIENT_SECRET,
-                                    code,
-                                    grant_type: 'authorization_code',
-                                    redirect_uri: redirectUri,
-                                }).toString();
-                                const tokenRes = await requestGoogleApi('https://oauth2.googleapis.com/token', params);
-                                if (tokenRes.status !== 200 || !tokenRes.data.refresh_token) {
-                                    reject(new Error(`换取 Token 失败: ${JSON.stringify(tokenRes.data)}`));
-                                    return;
-                                }
-                                const rfToken = tokenRes.data.refresh_token;
-                                const accToken = tokenRes.data.access_token || '';
-                                const idToken = tokenRes.data.id_token || '';
-                                let email = '';
-                                let name = '';
-                                if (idToken) {
-                                    try {
-                                        const payload = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString('utf8'));
-                                        email = payload.email || '';
-                                        name = payload.name || '';
-                                    }
-                                    catch { }
-                                }
-                                if (!email && accToken) {
-                                    try {
-                                        const infoRes = await requestGoogleApi(`https://oauth2.googleapis.com/tokeninfo?access_token=${accToken}`);
-                                        email = infoRes.data.email || '';
-                                    }
-                                    catch { }
-                                }
-                                resolve({
-                                    email: email || 'google-user@gmail.com',
-                                    refreshToken: rfToken,
-                                    accessToken: accToken,
-                                    idToken,
-                                    name: name || (email ? email.split('@')[0] : 'User'),
-                                });
-                            }
-                            catch (e) {
-                                reject(e);
-                            }
                         }
+                        catch { }
+                        // 先完成 Token 交换，再回复浏览器——避免交换失败时页面却显示"授权成功"
+                        try {
+                            const redirectUri = `http://127.0.0.1:${currentPort}/oauth-callback`;
+                            const params = new url_1.URLSearchParams({
+                                client_id: exports.ANTIGRAVITY_CLIENT_ID,
+                                client_secret: exports.ANTIGRAVITY_CLIENT_SECRET,
+                                code,
+                                grant_type: 'authorization_code',
+                                redirect_uri: redirectUri,
+                            }).toString();
+                            const tokenRes = await requestGoogleApi('https://oauth2.googleapis.com/token', params);
+                            if (tokenRes.status !== 200 || !tokenRes.data.refresh_token) {
+                                const errMsg = `换取 Token 失败: ${JSON.stringify(tokenRes.data).slice(0, 300)}`;
+                                respondPage(res, 200, '❌', '授权失败', errMsg);
+                                reject(new Error(errMsg));
+                                return;
+                            }
+                            const rfToken = tokenRes.data.refresh_token;
+                            const accToken = tokenRes.data.access_token || '';
+                            const idToken = tokenRes.data.id_token || '';
+                            let email = '';
+                            let name = '';
+                            if (idToken) {
+                                try {
+                                    const payload = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString('utf8'));
+                                    email = payload.email || '';
+                                    name = payload.name || '';
+                                }
+                                catch { }
+                            }
+                            if (!email && accToken) {
+                                try {
+                                    const infoRes = await requestGoogleApi(`https://oauth2.googleapis.com/tokeninfo?access_token=${accToken}`);
+                                    email = infoRes.data.email || '';
+                                }
+                                catch { }
+                            }
+                            respondPage(res, 200, '🚀', 'Google 账号授权成功！', '凭据已成功同步至 AntiGravity 账号池。<br>您可以关闭此浏览器窗口并返回 VS Code 开始编码。');
+                            resolve({
+                                email: email || 'google-user@gmail.com',
+                                refreshToken: rfToken,
+                                accessToken: accToken,
+                                idToken,
+                                name: name || (email ? email.split('@')[0] : 'User'),
+                            });
+                        }
+                        catch (e) {
+                            respondPage(res, 500, '❌', '授权失败', e?.message || String(e));
+                            reject(e);
+                        }
+                        return;
                     }
                 }
+                // 其他路径（如 /favicon.ico）直接 404，避免连接悬挂
+                res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+                res.end('Not Found');
             }
             catch (err) {
                 if (!resolved) {
                     resolved = true;
-                    server.close();
+                    try {
+                        server.close();
+                    }
+                    catch { }
                     reject(err);
                 }
             }

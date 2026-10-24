@@ -3,7 +3,7 @@
 > 专为 **Google Antigravity**（反重力）打造的高性能 VS Code 状态监控、配额预警、多账号免关窗无感切换与高颜值仪表盘伴侣插件。
 
 [![VS Code Extension](https://img.shields.io/badge/VS%20Code-v1.80.0+-007acc.svg?logo=visualstudiocode)](https://marketplace.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.5.0-blue.svg)](https://github.com/)
+[![Version](https://img.shields.io/badge/version-1.6.2-blue.svg)](https://github.com/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4+-3178c6.svg?logo=typescript)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -22,14 +22,16 @@
 - **官方限制**：官方插件无法直观常驻查看配额，必须频繁点开侧边栏设置页查看。
 - **本插件解决方案**：
   - **状态栏默认展示**：`✨ 反重力: 56% (5h) | 周 77% | 今日 259.3M`（5小时限额在前，周限额在后，数字与官方页面 100% 吻合对齐）。
+  - **Gemini 4 独立额度显示**：当账号存在 Gemini 4 独立配额组时，状态栏自动追加 `G4 xx%/xx%`（5h/周），仪表盘与悬停浮窗中亦有独立明细卡片。
   - **低额度智能告警**：当 5小时限额 ≤ 20% 时状态栏变黄预警；≤ 5% 时变红告警。
   - **悬停浮窗 (Rich Tooltip)**：悬停即见当前登录邮箱、订阅等级、5h / 周周期限额明细表格、精确到分钟的重置倒计时（如 `4小时20分后 (2026-10-12 16:31)`）、生成速度（tokens/s）及首字延迟（TTFT）。
 
 ### 3. 高颜值赛博朋克深色仪表盘 (Cyberpunk Dashboard)
 - 点击状态栏一键呼出独立的高级监控仪表盘：
   - **10 大核心 KPI 卡片**：今日总 Token、输入/输出 Token、缓存节省、调用次数、估算费用（自动读取 `api_pricing.json` 计算）、吞吐速度、首字延迟、当前账号等。
-  - **24 小时整点柱状图**：清晰展示今日各小时段的 Token 生成热力分布。
-  - **模型占比环形图**：直观展示不同模型的 Token 消耗分布。
+  - **24 小时 / 多日真实柱状图**：按统计范围展示真实的每小时（今天/昨天）或每日（近 3/7/30 天）Token 生成分布，数据来自本地统计而非估算。
+  - **模型占比环形图**：直观展示不同模型的 Token 消耗与费用占比（真实 by_model 数据）。
+  - **统计范围一键切换**：`今天 / 昨天 / 近 3 天 / 近 7 天 / 近 30 天` 按钮即点即切，KPI、图表与模型明细全部联动。
   - **模型级别明细表格**：模型名、费用、输入/输出详细分解。
   - **顶部 5 大直接功能按钮**（每个按钮均可直接点击生效，绝无多余摆设）：
     - `➕ 导入账号 (Token)`：通过 OAuth Refresh Token 快速导入新 Google 账号。

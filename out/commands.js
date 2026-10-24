@@ -190,24 +190,13 @@ class CommandController {
                 const items = accounts.map((acc) => {
                     const isCurrent = acc.is_current ? '【当前使用中】' : '';
                     const tier = acc.quota?.subscription_tier || 'Google AI';
-                    let q5hStr = '--';
-                    let qWkStr = '--';
-                    if (acc.quota?.quota_groups) {
-                        for (const g of acc.quota.quota_groups) {
-                            if (g.display_name.includes('Gemini')) {
-                                for (const b of g.buckets) {
-                                    if (b.window === '5h')
-                                        q5hStr = (0, utils_1.formatPercent)(b.remaining_fraction);
-                                    if (b.window === 'weekly')
-                                        qWkStr = (0, utils_1.formatPercent)(b.remaining_fraction);
-                                }
-                            }
-                        }
-                    }
+                    // 按配额族汇总（Gemini / Gemini 4 / Claude-GPT），多组不再互相覆盖
+                    const fams = (0, utils_1.extractQuotaFamilies)(acc.quota?.quota_groups);
+                    const quotaBits = fams.map((f) => `${f.displayName} ${f.fiveHour !== null ? (0, utils_1.formatPercent)(f.fiveHour) : '--'}/${f.weekly !== null ? (0, utils_1.formatPercent)(f.weekly) : '--'}`);
                     return {
                         label: `$(account) ${acc.email}`,
                         description: `${isCurrent} [${tier}] ${acc.name || ''}`,
-                        detail: `Gemini 5h限额: ${q5hStr} | 周限额: ${qWkStr} | ID: ${acc.id.substring(0, 8)}...`,
+                        detail: `${quotaBits.length ? quotaBits.join(' · ') + ' (5h/周) | ' : ''}ID: ${acc.id.substring(0, 8)}...`,
                         account: acc,
                     };
                 });
