@@ -91,7 +91,7 @@ export class StatusBarController {
     const g4Weekly = gemini4 ? gemini4.weekly : null;
     const g4Compact =
       primary?.key === 'gemini' && g4Five !== null
-        ? ` | G4 ${formatPercent(g4Five)}${
+        ? ` | G4${(g4Weekly !== null ? g4Weekly : g4Five) <= 0.1 ? '⚠' : ''} ${formatPercent(g4Five)}${
             g4Weekly !== null ? `/${formatPercent(g4Weekly)}` : ''
           }`
         : '';
@@ -131,9 +131,8 @@ export class StatusBarController {
         weekly: weeklyGeminiFraction,
       });
     }
-    if (gemini4 && primary?.key === 'gemini') {
-      watched.push(gemini4);
-    }
+    // 注意：Gemini 4 Argon 是独立周池，不参与底色告警（否则 G4 余量低会让整条状态栏常红，
+    // 而显示的 3.8 数字明明充足）；G4 偏低时仅在文字后加 ⚠ 提示。
 
     const anyLow = watched.some(
       (f) =>
