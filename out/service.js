@@ -72,8 +72,11 @@ class AntigravityService {
         this.ensureWatchers();
     }
     /**
+  
      * 子进程环境：仅当配置了代理或环境变量存在时注入，
+  
      * 不再强制硬编码 127.0.0.1:7897（没有本地代理时会导致 CLI 联网全部失败/超时）。
+  
      */
     getExecEnv() {
         const proxy = (0, utils_1.getProxyUrl)();
@@ -120,8 +123,11 @@ class AntigravityService {
         }
     }
     /**
+  
      * 挂载文件监听。会在每次 fetchStatus 时懒调用：
+  
      * 若激活时 ~/.antigravity_tools 尚不存在（后导入账号/装 CLI），也能补挂。
+  
      */
     ensureWatchers() {
         const toolsDir = (0, utils_1.getAntigravityToolsDir)();
@@ -194,8 +200,11 @@ class AntigravityService {
         }
     }
     /**
+  
      * 监听 accounts.json。Windows 上很多工具是"写临时文件 + rename 替换"的原子写，
+  
      * 只听 'change' 会漏事件，且 rename 后旧 inode 失效必须重新挂监听。
+  
      */
     watchAccountsFile(accountsJsonPath) {
         try {
@@ -309,8 +318,11 @@ class AntigravityService {
         return { running: false, pid: null };
     }
     /**
+  
      * agy-switch stats 的本地缓存轮询：
+  
      * 状态栏每 5 秒、仪表盘每 4 秒各刷一次，不再每次都拉起一个子进程。
+  
      */
     async fetchStatsCached() {
         const config = vscode.workspace.getConfiguration('antigravityStatus');
@@ -430,7 +442,9 @@ class AntigravityService {
         return result;
     }
     /**
+  
      * 通过 agy-switch（及可选的内存级 Cloud Code 回退）向云端刷新指定账号配额
+  
      */
     async refreshAccountOnlineById(accountId, options) {
         const executable = this.getAgySwitchExecutable();
@@ -533,7 +547,9 @@ class AntigravityService {
         };
     }
     /**
+  
      * 有界并发（5 Worker）批量向 Google 云端刷新全部账号剩余额度
+  
      */
     async refreshAllAccountsOnline(onProgress) {
         if (this.batchRefreshInFlight) {
@@ -565,8 +581,11 @@ class AntigravityService {
         return this.batchRefreshInFlight;
     }
     /**
+  
      * 从本地运行中的 agy.exe --hub RPC 读取最新三组配额（含独立的 Gemini 4 Argon 周限额桶 gemini-argon-wtu-weekly）
+  
      * 并回写至当前激活账号详情文件，弥补 agy-switch CLI 未返回 Argon 独立桶的问题。
+  
      */
     async syncActiveAccountFromAgyHub(targetAccountId, force = false) {
         const now = Date.now();
@@ -724,7 +743,9 @@ class AntigravityService {
         });
     }
     /**
+  
      * 通过 agy-switch 在后台向 Google 云端刷新当前账号配额
+  
      */
     async refreshCurrentAccountOnline() {
         const now = Date.now();
@@ -854,8 +875,11 @@ class AntigravityService {
         };
     }
     /**
+  
      * 账号总数：只读 accounts.json 一个文件。
+  
      * 仪表盘高频轮询用这个，不要为拿个数把全部账号详情文件读一遍。
+  
      */
     countAccounts() {
         if (this.accountSummariesCache) {
@@ -926,9 +950,13 @@ class AntigravityService {
         return Array.isArray(parsed?.accounts) ? parsed.accounts : [];
     }
     /**
+  
      * 获取全部账号结构化剩余额度摘要（已按智能优先级排序）。
+  
      * 默认带 10 秒内存缓存，并在 accounts/ 或 accounts.json 文件变动时立即失效，
+  
      * 保证状态栏 5s 轮询与仪表盘 4s 轮询零额外磁盘压力。
+  
      */
     async fetchAccountSummaries(forceFresh = false) {
         const now = Date.now();
@@ -946,18 +974,117 @@ class AntigravityService {
             return this.accountSummariesCache ? this.accountSummariesCache.list : [];
         }
     }
+    /**
+  
+     * 纯原生无依赖账号切换：
+  
+     * 即使系统未安装 agy-switch.exe 或 CLI 报错，插件也能独立完成全流程切换。
+  
+     * 1. 检索目标账号（按 id 或 email）
+  
+     * 2. 更新 ~/.antigravity_tools/accounts.json 中的 current_account_id 与 last_used
+  
+     * 3. 更新 ~/.antigravity_tools/accounts/<id>.json 中的 last_used
+  
+     * 4. 直写 ~/.gemini/jetski-standalone-oauth-token 凭据文件（供核心后台进程读取）
+  
+     */
+    /**
+     * 纯原生无依赖账号切换：
+     * 即使系统未安装 agy-switch.exe 或 CLI 报错，插件也能独立完成全流程切换。
+     * 1. 检索目标账号（按 id 或 email）
+     * 2. 更新 ~/.antigravity_tools/accounts.json 中的 current_account_id 与 last_used
+     * 3. 更新 ~/.antigravity_tools/accounts/<id>.json 中的 last_used
+     * 4. 直写 ~/.gemini/jetski-standalone-oauth-token 凭据文件（供核心后台进程读取）
+     */
+    async switchAccountNatively(accountIdOrEmail) {
+        const toolsDir = (0, utils_1.getAntigravityToolsDir)();
+        const accountsJsonPath = path.join(toolsDir, 'accounts.json');
+        if (!fs.existsSync(accountsJsonPath)) {
+            throw new Error(`账号索引文件不存在: ${accountsJsonPath}`);
+        }
+        const raw = fs.readFileSync(accountsJsonPath, 'utf-8');
+        const indexData = JSON.parse(raw);
+        const accounts = Array.isArray(indexData.accounts) ? indexData.accounts : [];
+        const target = accounts.find((a) => a.id === accountIdOrEmail || a.email.toLowerCase() === accountIdOrEmail.toLowerCase());
+        if (!target) {
+            throw new Error(`未找到匹配的账号: ${accountIdOrEmail}`);
+        }
+        const detailPath = path.join(toolsDir, 'accounts', `${target.id}.json`);
+        if (!fs.existsSync(detailPath)) {
+            throw new Error(`账号详情文件不存在: ${detailPath}`);
+        }
+        const detailRaw = fs.readFileSync(detailPath, 'utf-8');
+        const detail = JSON.parse(detailRaw);
+        const token = detail.token;
+        if (!token || !token.refresh_token) {
+            throw new Error(`账号 ${target.email} 凭据不完整（缺少 refresh_token）`);
+        }
+        const nowSec = Math.floor(Date.now() / 1000);
+        // 1. 更新 accounts.json（保持 last_used 为整数时间戳，防止 agy-switch 反序列化失败）
+        indexData.current_account_id = target.id;
+        for (const a of accounts) {
+            if (a.id === target.id) {
+                a.last_used = nowSec;
+            }
+        }
+        fs.writeFileSync(accountsJsonPath, JSON.stringify(indexData, null, 2), 'utf-8');
+        this.lastKnownAccountId = target.id;
+        // 2. 更新 detail 文件中的 last_used
+        detail.last_used = nowSec;
+        fs.writeFileSync(detailPath, JSON.stringify(detail, null, 2), 'utf-8');
+        // 3. 写入 ~/.gemini/jetski-standalone-oauth-token 凭据
+        const geminiDir = path.join(os.homedir(), '.gemini');
+        if (!fs.existsSync(geminiDir)) {
+            fs.mkdirSync(geminiDir, { recursive: true });
+        }
+        const jetskiTokenPath = path.join(geminiDir, 'jetski-standalone-oauth-token');
+        let expiryIso = '';
+        if (typeof token.expiry_timestamp === 'number') {
+            expiryIso = new Date(token.expiry_timestamp * 1000).toISOString();
+        }
+        else if (typeof token.expires_in === 'number') {
+            expiryIso = new Date(Date.now() + token.expires_in * 1000).toISOString();
+        }
+        else {
+            expiryIso = new Date(Date.now() + 3600 * 1000).toISOString();
+        }
+        const jetskiPayload = {
+            token: {
+                access_token: token.access_token || '',
+                token_type: token.token_type || 'Bearer',
+                refresh_token: token.refresh_token,
+                expiry: expiryIso,
+            },
+            auth_method: 'consumer',
+            id_token: token.id_token || '',
+        };
+        fs.writeFileSync(jetskiTokenPath, JSON.stringify(jetskiPayload, null, 2), 'utf-8');
+        return { success: true, accountId: target.id, email: target.email };
+    }
     async switchAccount(accountIdOrEmail) {
         const executable = this.getAgySwitchExecutable();
-        if (!executable) {
-            throw new Error('未找到 agy-switch.exe。');
-        }
+        let cliSwitched = false;
         try {
             this.isSwitchingInternally = true;
-            await execFileAsync(executable, ['switch', accountIdOrEmail, '--target', 'app', '--json'], { timeout: 15000, encoding: 'utf-8', env: this.getExecEnv() });
-            try {
-                await execFileAsync(executable, ['switch', accountIdOrEmail, '--target', 'ide', '--json'], { timeout: 8000, encoding: 'utf-8', env: this.getExecEnv() });
+            // 1. 如果检测到 agy-switch CLI 可执行文件，优先尝试通过 CLI 切换
+            if (executable) {
+                try {
+                    await execFileAsync(executable, ['switch', accountIdOrEmail, '--target', 'app', '--json'], { timeout: 15000, encoding: 'utf-8', env: this.getExecEnv() });
+                    try {
+                        await execFileAsync(executable, ['switch', accountIdOrEmail, '--target', 'ide', '--json'], { timeout: 8000, encoding: 'utf-8', env: this.getExecEnv() });
+                    }
+                    catch { }
+                    cliSwitched = true;
+                }
+                catch (cliErr) {
+                    console.warn('agy-switch CLI 执行切换失败，自动降级为插件原生独立切换:', cliErr);
+                }
             }
-            catch { }
+            // 2. 若未安装 agy-switch 或 CLI 执行失败，直接使用插件原生独立切换
+            if (!cliSwitched) {
+                await this.switchAccountNatively(accountIdOrEmail);
+            }
             const toolsDir = (0, utils_1.getAntigravityToolsDir)();
             const accountsJsonPath = path.join(toolsDir, 'accounts.json');
             if (fs.existsSync(accountsJsonPath)) {

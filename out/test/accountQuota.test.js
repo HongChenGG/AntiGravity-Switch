@@ -900,6 +900,15 @@ test('8.1 Dashboard Account Pool HTML renderer: renders G4 independent pool, res
     }), BASE_NOW_MS);
     assert.deepStrictEqual(classifyAccountPoolFilters(g4Current), ['all', 'g4']);
     assert.deepStrictEqual(classifyAccountPoolFilters(coolingXss), ['all', 'pro']);
+    const freeStarter = (0, accountQuota_1.summarizeAccount)(makeAccount({
+        id: 'acc-free',
+        email: 'free@example.com',
+        quota: {
+            subscription_tier: 'Antigravity Starter Quota',
+            models: [{ name: 'gemini-2.5-flash', percentage: 100, reset_time: isoAfterHours(1) }],
+        },
+    }), BASE_NOW_MS);
+    assert.deepStrictEqual(classifyAccountPoolFilters(freeStarter), ['all', 'free']);
     const html = renderAccountPoolSection([g4Current, coolingXss], BASE_NOW_MS);
     assert.ok(html.includes('🔥 G4 独立周池'));
     assert.ok(html.includes('15%'));
