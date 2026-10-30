@@ -1,7 +1,7 @@
 {
   "name": "antigravity-status-bar",
   "displayName": "Google Antigravity Status & Reload",
-  "description": "VS Code 状态栏反重力插件监控：实时展示 5小时配额、周配额、高颜值Token仪表盘，并提供外部切号自动热重载与OAuth Token账号导入",
+  "description": "VS Code 状态栏反重力插件监控：实时展示多账号池剩余额度与重置倒计时、5小时配额、周配额、高颜值Token仪表盘，支持并发刷新全池额度与一键热切号",
   "version": "1.7.0",
   "publisher": "local-dev",
   "engines": {
@@ -43,6 +43,11 @@
       {
         "command": "antigravity-status.refresh",
         "title": "反重力: 刷新状态与统计",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity.refreshAllQuotas",
+        "title": "反重力: 刷新全部账号剩余额度",
         "category": "Antigravity"
       },
       {
@@ -141,7 +146,8 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "tsc -p ./ && node ./out/test/accountQuota.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

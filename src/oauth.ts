@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as https from 'https';
 import { URL, URLSearchParams } from 'url';
 import * as vscode from 'vscode';
+import { ModelQuota } from './types';
 import { getProxyUrl } from './utils';
 
 function decodeStr(b64: string): string {
@@ -25,7 +26,8 @@ export interface OAuthAccountResult {
 
 export function requestGoogleApi(
   urlStr: string,
-  postData?: string
+  postData?: string,
+  extraHeaders?: Record<string, string>
 ): Promise<{ status: number; data: any }> {
   return new Promise((resolve, reject) => {
     const url = new URL(urlStr);
@@ -47,6 +49,23 @@ export function requestGoogleApi(
       });
     const fail = (err: Error) => settle(() => reject(err));
 
+    const buildHeaders = (withHost?: string): Record<string, string | number> => {
+      const headers: Record<string, string | number> = {};
+      if (withHost) {
+        headers.Host = withHost;
+      }
+      if (postData !== undefined) {
+        headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        headers['Content-Length'] = Buffer.byteLength(postData);
+      }
+      if (extraHeaders) {
+        for (const [k, v] of Object.entries(extraHeaders)) {
+          headers[k] = v;
+        }
+      }
+      return headers;
+    };
+
     let directTried = false;
     const doDirect = () => {
       // timeout 与 error 可能先后触发，直连重试只允许一次
@@ -57,13 +76,8 @@ export function requestGoogleApi(
       const req = https.request(
         urlStr,
         {
-          method: postData ? 'POST' : 'GET',
-          headers: postData
-            ? {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Content-Length': Buffer.byteLength(postData),
-              }
-            : {},
+          method: postData !== undefined ? 'POST' : 'GET',
+          headers: buildHeaders(),
           timeout: 15000,
         },
         (res) => {
@@ -74,7 +88,7 @@ export function requestGoogleApi(
       );
       req.on('error', fail);
       req.on('timeout', () => req.destroy(new Error('请求 Google 超时 (直连)')));
-      if (postData) req.write(postData);
+      if (postData !== undefined) req.write(postData);
       req.end();
     };
 
@@ -116,16 +130,8 @@ export function requestGoogleApi(
           host: url.hostname,
           port: 443,
           path: url.pathname + url.search,
-          method: postData ? 'POST' : 'GET',
-          headers: {
-            Host: url.hostname,
-            ...(postData
-              ? {
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                  'Content-Length': Buffer.byteLength(postData),
-                }
-              : {}),
-          },
+          method: postData !== undefined ? 'POST' : 'GET',
+          headers: buildHeaders(url.hostname),
           socket: socket,
           agent: false,
           timeout: 15000,
@@ -143,7 +149,7 @@ export function requestGoogleApi(
         doDirect();
       });
       tlsReq.on('timeout', () => tlsReq.destroy(new Error('请求 Google 超时 (代理)')));
-      if (postData) tlsReq.write(postData);
+      if (postData !== undefined) tlsReq.write(postData);
       tlsReq.end();
     });
 
@@ -158,6 +164,61 @@ export function requestGoogleApi(
 
     proxyReq.end();
   });
+}
+
+/**
+ * 内存级回退查询：当 GCP Standard 等账号经 agy-switch refresh 后 models 仍为空时，
+ * 直接通过 OAuth Bearer Token 请求 Cloud Code fetchAvailableModels 获取各模型剩余比例与重置时间。
+ */
+export async function fetchAvailableModelsOnline(
+  accessToken: string,
+  projectId?: string | null
+): Promise<ModelQuota[]> {
+  const payload =
+    projectId && projectId.trim() !== '' ? JSON.stringify({ project: projectId.trim() }) : '{}';
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'User-Agent': 'antigravity/1.15.8 windows/amd64',
+  };
+
+  const endpoints = [
+    'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels',
+    'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
+  ];
+
+  for (const endpoint of endpoints) {
+    try {
+      const res = await requestGoogleApi(endpoint, payload, headers);
+      if (res.status === 200 && res.data && typeof res.data.models === 'object') {
+        const list: ModelQuota[] = [];
+        for (const [modelName, info] of Object.entries(
+          res.data.models as Record<string, any>
+        )) {
+          if (!info || typeof info !== 'object') continue;
+          const qInfo = info.quotaInfo || {};
+          const rawFrac =
+            typeof qInfo.remainingFraction === 'number' && !isNaN(qInfo.remainingFraction)
+              ? Math.max(0, Math.min(1, qInfo.remainingFraction))
+              : 1;
+          list.push({
+            name: modelName,
+            percentage: Math.round(rawFrac * 100),
+            observed_remaining_fraction: rawFrac,
+            reset_time: typeof qInfo.resetTime === 'string' ? qInfo.resetTime : '',
+            display_name: typeof info.displayName === 'string' ? info.displayName : undefined,
+          });
+        }
+        if (list.length > 0) {
+          return list;
+        }
+      }
+    } catch {
+      // try next endpoint
+    }
+  }
+
+  return [];
 }
 
 export async function exchangeRefreshToken(

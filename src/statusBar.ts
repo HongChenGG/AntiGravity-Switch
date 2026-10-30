@@ -1,5 +1,10 @@
 import * as vscode from 'vscode';
-import { AntigravityStatus, QuotaFamily } from './types';
+import { AccountSummary, AntigravityStatus, QuotaFamily } from './types';
+import {
+  computePoolStats,
+  normalizeQuotaGroups,
+  summarizeAccount,
+} from './accountQuota';
 import {
   extractQuotaFamilies,
   formatDateLocal,
@@ -25,7 +30,7 @@ export class StatusBarController {
     this.statusBarItem.show();
   }
 
-  public update(status: AntigravityStatus): void {
+  public update(status: AntigravityStatus, poolSummaries?: AccountSummary[]): void {
     const config = vscode.workspace.getConfiguration('antigravityStatus');
     const displayFormat = config.get<string>('displayFormat', 'standard');
 
@@ -44,6 +49,7 @@ export class StatusBarController {
     const families = extractQuotaFamilies(status.account?.quota?.quota_groups);
     const primary = pickPrimaryGeminiFamily(families);
     const gemini4 = pickGemini4Family(families);
+    const currentSummary = status.account ? summarizeAccount(status.account) : null;
 
     // 模型级兜底：Google 尚未拆分 G4 独立配额组、但 models 里出现 gemini-4 条目时，
     // 用该模型的剩余百分比展示 G4
@@ -52,25 +58,24 @@ export class StatusBarController {
       const g4Model = status.account.quota.models.find((m) => isGemini4ModelName(m.name));
       if (g4Model) {
         g4ModelFraction =
-          (g4Model as any).observed_remaining_fraction ?? g4Model.percentage / 100;
+          g4Model.observed_remaining_fraction ?? g4Model.percentage / 100;
       }
     }
 
     let fiveHourGeminiFraction = primary?.fiveHour ?? null;
     let weeklyGeminiFraction = primary?.weekly ?? null;
 
-    // 旧版数据结构兜底：仅有 models 列表时取 Gemini 模型百分比
+    // 无 quota_groups 时（例如 GCP Standard 账号），利用 summarizeAccount 优先提取 3.8 模型配额
     if (
       fiveHourGeminiFraction === null &&
-      status.account?.quota?.models?.length
+      weeklyGeminiFraction === null &&
+      currentSummary
     ) {
-      const geminiModel = status.account.quota.models.find((m) =>
-        m.name.toLowerCase().includes('gemini')
-      );
-      if (geminiModel) {
-        fiveHourGeminiFraction =
-          (geminiModel as any).observed_remaining_fraction ??
-          geminiModel.percentage / 100;
+      if (currentSummary.gemini5hPct !== null) {
+        fiveHourGeminiFraction = currentSummary.gemini5hPct / 100;
+      }
+      if (currentSummary.geminiWeeklyPct !== null) {
+        weeklyGeminiFraction = currentSummary.geminiWeeklyPct / 100;
       }
     }
 
@@ -114,10 +119,17 @@ export class StatusBarController {
         break;
     }
 
-    // 预警配色：基础 Gemini 与 Gemini 4 任一族触线即告警
+    // 预警配色：基础 Gemini 与 Gemini 4 任一族触线即告警（同时覆盖 models-only 账号）
     const watched: QuotaFamily[] = [];
     if (primary) {
       watched.push(primary);
+    } else if (fiveHourGeminiFraction !== null || weeklyGeminiFraction !== null) {
+      watched.push({
+        key: 'gemini',
+        displayName: 'Gemini',
+        fiveHour: fiveHourGeminiFraction,
+        weekly: weeklyGeminiFraction,
+      });
     }
     if (gemini4 && primary?.key === 'gemini') {
       watched.push(gemini4);
@@ -146,12 +158,19 @@ export class StatusBarController {
       this.statusBarItem.backgroundColor = undefined;
     }
 
-    this.statusBarItem.tooltip = this.buildTooltip(status, families);
+    this.statusBarItem.tooltip = this.buildTooltip(
+      status,
+      families,
+      currentSummary,
+      poolSummaries
+    );
   }
 
   private buildTooltip(
     status: AntigravityStatus,
-    families: QuotaFamily[]
+    families: QuotaFamily[],
+    currentSummary: AccountSummary | null,
+    poolSummaries?: AccountSummary[]
   ): vscode.MarkdownString {
     const md = new vscode.MarkdownString('', true);
     md.isTrusted = true;
@@ -160,37 +179,69 @@ export class StatusBarController {
     md.appendMarkdown('### 🚀 Google Antigravity (反重力) 状态监控\n\n');
 
     const email = status.account?.email || '未登录/未识别';
-    const tier = status.account?.quota?.subscription_tier || 'Google AI';
+    const rawTier = status.account?.quota?.subscription_tier;
+    const tierLabel = rawTier
+      ? `${rawTier}${
+          currentSummary?.capabilityTags.length
+            ? ` (${currentSummary.capabilityTags.join(' · ')})`
+            : ''
+        }`
+      : currentSummary
+      ? `${currentSummary.tierDisplay}${
+          currentSummary.capabilityTags.length
+            ? ` (${currentSummary.capabilityTags.join(' · ')})`
+            : ''
+        }`
+      : 'Google AI';
     const processStatus = status.isAgyRunning
       ? `🟢 运行中 (PID: ${status.agyPid ?? '自动托管'})`
       : '🔴 未检测到后台进程';
 
     md.appendMarkdown(`- **当前账号**: \`${email}\`\n`);
-    md.appendMarkdown(`- **订阅等级**: \`${tier}\`\n`);
-    md.appendMarkdown(`- **核心引擎**: \`agy.exe\` ${processStatus}\n\n`);
+    md.appendMarkdown(`- **订阅等级**: \`${tierLabel}\`\n`);
+    md.appendMarkdown(`- **核心引擎**: \`agy.exe\` ${processStatus}\n`);
 
-    // 配额族摘要（含 Gemini 4）
+    // 账号池整体剩余可用概览
+    if (poolSummaries && poolSummaries.length > 0) {
+      const pool = computePoolStats(poolSummaries);
+      const coolingBit = pool.rateLimited > 0 ? ` · 限流冷却 \`${pool.rateLimited}\`` : '';
+      md.appendMarkdown(
+        `- **账号池余量**: 总计 \`${pool.total}\` · **3.8 可用** \`${pool.usableGemini}\` · **G4 可用** \`${pool.usableG4}\`${coolingBit}\n`
+      );
+    }
+    md.appendMarkdown('\n');
+
+    // 配额族摘要（含 Gemini 4 与重置倒计时）
     for (const f of families) {
       if (f.key === 'claude-gpt') {
         continue;
       }
+      const r5 = f.fiveHourReset ? ` (${formatTimeRemaining(f.fiveHourReset)}重置)` : '';
+      const rw = f.weeklyReset ? ` (${formatTimeRemaining(f.weeklyReset)}重置)` : '';
       md.appendMarkdown(
-        `- **${f.displayName}**: 5h \`${formatPercent(f.fiveHour)}\` · 周 \`${formatPercent(
+        `- **${f.displayName}**: 5h \`${formatPercent(f.fiveHour)}\`${r5} · 周 \`${formatPercent(
           f.weekly
-        )}\`\n`
+        )}\`${rw}\n`
       );
     }
     if (families.some((f) => f.key !== 'claude-gpt')) {
       md.appendMarkdown('\n');
+    } else if (currentSummary && currentSummary.effectiveGeminiPct !== null) {
+      const rStr = currentSummary.geminiResetTime
+        ? ` (${formatTimeRemaining(currentSummary.geminiResetTime)}重置)`
+        : '';
+      md.appendMarkdown(
+        `- **Gemini 3.8**: 可用 \`${currentSummary.effectiveGeminiPct}%\`${rStr}\n\n`
+      );
     }
 
     // Quota details
     md.appendMarkdown('---\n');
     md.appendMarkdown('#### ⏳ 周期限额与配额 (Quotas)\n\n');
 
-    const quotaGroups = status.account?.quota?.quota_groups;
-    if (quotaGroups && quotaGroups.length > 0) {
-      md.appendMarkdown('| 模型组 | 周期 | 剩余配额 | 重置时间 |\n');
+    const quotaGroups = normalizeQuotaGroups(status.account?.quota?.quota_groups);
+    if (quotaGroups.length > 0) {
+      md.appendMarkdown('| 模型组 | 周期 | 剩余配额 | 多久重置 |\n');
       md.appendMarkdown('| :--- | :--- | :--- | :--- |\n');
       for (const group of quotaGroups) {
         for (const bucket of group.buckets) {
@@ -210,11 +261,14 @@ export class StatusBarController {
       }
       md.appendMarkdown('\n');
     } else if (status.account?.quota?.models?.length) {
-      md.appendMarkdown('| 模型 | 剩余百分比 | 重置时间 |\n');
+      md.appendMarkdown('| 模型 | 剩余百分比 | 多久重置 |\n');
       md.appendMarkdown('| :--- | :--- | :--- |\n');
       for (const m of status.account.quota.models.slice(0, 6)) {
+        const resetLocal = formatDateLocal(m.reset_time);
         md.appendMarkdown(
-          `| ${m.name} | **${m.percentage}%** | ${formatTimeRemaining(m.reset_time)} |\n`
+          `| ${m.name} | **${m.percentage}%** | ${formatTimeRemaining(m.reset_time)}${
+            resetLocal ? ` (${resetLocal})` : ''
+          } |\n`
         );
       }
       md.appendMarkdown('\n');
@@ -263,10 +317,11 @@ export class StatusBarController {
     md.appendMarkdown(`*更新时间: ${updateTimeStr}*\n\n`);
     md.appendMarkdown(
       `👉 [📊 高级仪表盘](command:antigravity-status.showDashboard) &nbsp;|&nbsp; ` +
-      `[⚡ 热重载插件](command:antigravity-status.reloadExtensionHost) &nbsp;|&nbsp; ` +
-      `[👥 切换账号](command:antigravity-status.switchAccount) &nbsp;|&nbsp; ` +
-      `[➕ 导入账号](command:antigravity-status.importAccount) &nbsp;|&nbsp; ` +
-      `[⚙️ 菜单](command:antigravity-status.showMenu)`
+        `[$(arrow-swap) 切换账号](command:antigravity.switchAccount) &nbsp;|&nbsp; ` +
+        `[$(sync) 刷新全池额度](command:antigravity.refreshAllQuotas) &nbsp;|&nbsp; ` +
+        `[⚡ 热重载](command:antigravity-status.reloadExtensionHost) &nbsp;|&nbsp; ` +
+        `[➕ 导入](command:antigravity-status.importAccount) &nbsp;|&nbsp; ` +
+        `[⚙️ 菜单](command:antigravity-status.showMenu)`
     );
 
     return md;

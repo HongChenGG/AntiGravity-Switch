@@ -1,15 +1,13 @@
 import * as vscode from 'vscode';
 import { AntigravityService } from './service';
 import { DashboardPanel } from './dashboardPanel';
-import { AntigravityStatus } from './types';
+import { AccountSummary, AntigravityStatus } from './types';
 import { loginWithGoogleBrowser, resolveTokenInfo } from './oauth';
 import {
-  extractQuotaFamilies,
-  formatDateLocal,
-  formatPercent,
-  formatTimeRemaining,
-  formatTokens,
-} from './utils';
+  computePoolStats,
+  formatAccountQuickPickDisplay,
+  sortGroupRank,
+} from './accountQuota';
 
 export class CommandController {
   private outputChannel: vscode.OutputChannel;
@@ -38,8 +36,9 @@ export class CommandController {
       this.service,
       () => this.reloadExtensionHost(),
       () => this.restartBackend(),
-      () => this.switchAccount(),
-      () => this.importAccount()
+      (targetIdOrEmail?: string) => this.switchAccount(targetIdOrEmail),
+      () => this.importAccount(),
+      () => this.refreshAllQuotas()
     );
   }
 
@@ -55,22 +54,27 @@ export class CommandController {
       {
         id: 'show-dashboard',
         label: '$(dashboard) 📊 打开高级监控仪表盘 (Advanced Dashboard)',
-        description: '高颜值图表看板：今日Token、费用估算、生成速度、模型明细',
+        description: '账号池剩余额度总览 & 一键切号、G4 识别、重置倒计时、Token 与费用看板',
+      },
+      {
+        id: 'switch-account',
+        label: `$(account) 👥 切换反重力账号 & 查看各号剩余额度${email}`,
+        description: '置顶 🔥 Gemini 4 + Opus 5.5 账号，实时查看 5h/周限额与多久重置',
+      },
+      {
+        id: 'refresh-all-quotas',
+        label: '$(sync) 🔄 刷新全部账号最新剩余额度',
+        description: '并发查询账号池内所有账号的 5h / 周限额与重置倒计时',
       },
       {
         id: 'refresh',
-        label: '$(refresh) 🔄 刷新状态与配额数据',
-        description: '重新获取 5小时限额、周限额与 Token 消耗',
+        label: '$(refresh) 🔄 刷新当前账号状态与统计',
+        description: '重新获取当前激活账号配额与 Token 消耗',
       },
       {
         id: 'import-account',
         label: '$(plus) ➕ 导入账号 (OAuth Refresh Token)',
-        description: '通过邮箱与 refresh_token 直接添加新 Google 账号',
-      },
-      {
-        id: 'switch-account',
-        label: `$(account) 👥 切换反重力账号${email}`,
-        description: '直接选择并切换已登录的 Google 账号 (免重启 VS Code)',
+        description: '通过浏览器授权或粘贴 refresh_token 直接添加新 Google 账号',
       },
       {
         id: 'reload-ext-host',
@@ -106,7 +110,11 @@ export class CommandController {
       case 'show-dashboard':
         this.showDashboard();
         break;
+      case 'refresh-all-quotas':
+        await this.refreshAllQuotas();
+        break;
       case 'refresh':
+        this.service.refreshCurrentAccountOnline().catch(() => {});
         await this.refreshCallback();
         vscode.window.showInformationMessage('反重力状态已刷新！');
         break;
@@ -131,6 +139,46 @@ export class CommandController {
           'antigravityStatus'
         );
         break;
+    }
+  }
+
+  public async refreshAllQuotas(options?: {
+    reopenSwitchPicker?: boolean;
+  }): Promise<void> {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: '正在刷新全部账号额度...',
+        cancellable: false,
+      },
+      async (progress) => {
+        let lastCompleted = 0;
+        const result = await this.service.refreshAllAccountsOnline(
+          (completed, total, email) => {
+            const delta = completed - lastCompleted;
+            lastCompleted = completed;
+            const increment = total > 0 ? (delta / total) * 100 : 0;
+            progress.report({
+              increment,
+              message: `(${completed}/${total}) ${email}`,
+            });
+          }
+        );
+
+        await this.refreshCallback();
+
+        if (!options?.reopenSwitchPicker) {
+          const freshSummaries = await this.service.fetchAccountSummaries(true);
+          const pool = computePoolStats(freshSummaries);
+          vscode.window.showInformationMessage(
+            `已刷新 ${result.total} 个账号额度（成功 ${result.succeeded}）：🔥 G4 可用 ${pool.usableG4}/${pool.totalG4} 个，3.8 可用 ${pool.usableGemini} 个！`
+          );
+        }
+      }
+    );
+
+    if (options?.reopenSwitchPicker) {
+      await this.switchAccount();
     }
   }
 
@@ -176,66 +224,131 @@ export class CommandController {
     );
   }
 
-  public async switchAccount(targetEmail?: string): Promise<void> {
+  private getSectionHeaderForAccount(
+    acc: AccountSummary,
+    pool: ReturnType<typeof computePoolStats>
+  ): string {
+    const rank = sortGroupRank(acc);
+    if (rank === 0) {
+      return '📌 当前激活账号';
+    }
+    if (rank === 1) {
+      if (acc.hasGemini4) {
+        return `🔥 支持 Gemini 4 + Opus 5.5 可用账号 (${pool.usableG4}/${pool.totalG4} 可用)`;
+      }
+      return '⚡ Gemini 3.8 + Claude 4.6 可用付费账号';
+    }
+    if (rank === 2) {
+      return `⏳ 限流冷却中付费账号 (${pool.rateLimited} 个 · 自动显示恢复倒计时)`;
+    }
+    if (rank === 3) {
+      return '❓ 待同步额度账号';
+    }
+    return '🚫 受限 / 已禁用账号';
+  }
+
+  public async switchAccount(targetIdOrEmail?: string): Promise<void> {
     try {
-      const accounts = await this.service.fetchAccountsList();
-      if (!accounts || accounts.length === 0) {
+      const summaries = await this.service.fetchAccountSummaries(true);
+      if (!summaries || summaries.length === 0) {
         vscode.window.showWarningMessage('未发现已配置的反重力账号。');
         return;
       }
 
-      let chosenEmail = targetEmail;
+      let switchArg = targetIdOrEmail;
+      let displayEmail = targetIdOrEmail;
 
-      if (!chosenEmail) {
-        interface AccountPickItem extends vscode.QuickPickItem {
-          account: any;
+      if (switchArg) {
+        const matched = summaries.find(
+          (a) => a.id === switchArg || a.email.toLowerCase() === switchArg!.toLowerCase()
+        );
+        if (matched) {
+          switchArg = matched.id;
+          displayEmail = matched.email;
+        }
+      } else {
+        interface SwitchQuickPickItem extends vscode.QuickPickItem {
+          isRefreshAction?: boolean;
+          account?: AccountSummary;
         }
 
-        const items: AccountPickItem[] = accounts.map((acc) => {
-          const isCurrent = acc.is_current ? '【当前使用中】' : '';
-          const tier = acc.quota?.subscription_tier || 'Google AI';
+        const pool = computePoolStats(summaries);
+        const nowMs = Date.now();
 
-          // 按配额族汇总（Gemini / Gemini 4 / Claude-GPT），多组不再互相覆盖
-          const fams = extractQuotaFamilies(acc.quota?.quota_groups);
-          const quotaBits = fams.map(
-            (f) =>
-              `${f.displayName} ${f.fiveHour !== null ? formatPercent(f.fiveHour) : '--'}/${
-                f.weekly !== null ? formatPercent(f.weekly) : '--'
-              }`
-          );
+        const items: SwitchQuickPickItem[] = [
+          {
+            isRefreshAction: true,
+            label: '$(sync) 刷新全部账号最新剩余额度',
+            description: `并发查询全部 ${pool.total} 个账号 5h/周限额、多久重置与 🔥 G4 可用状态 (当前 G4 可用 ${pool.usableG4}/${pool.totalG4} · 3.8 可用 ${pool.usableGemini})`,
+            alwaysShow: true,
+          },
+        ];
 
-          return {
-            label: `$(account) ${acc.email}`,
-            description: `${isCurrent} [${tier}] ${acc.name || ''}`,
-            detail: `${
-              quotaBits.length ? quotaBits.join(' · ') + ' (5h/周) | ' : ''
-            }ID: ${acc.id.substring(0, 8)}...`,
+        let lastSection = '';
+        for (const acc of summaries) {
+          const section = this.getSectionHeaderForAccount(acc, pool);
+          if (section !== lastSection) {
+            lastSection = section;
+            items.push({
+              label: section,
+              kind: vscode.QuickPickItemKind.Separator,
+            });
+          }
+          const disp = formatAccountQuickPickDisplay(acc, nowMs);
+          items.push({
+            label: disp.label,
+            description: disp.description,
+            detail: disp.detail,
             account: acc,
-          };
-        });
+          });
+        }
 
         const chosen = await vscode.window.showQuickPick(items, {
-          placeHolder: '选择要切换的目标账号 (切换后将自动热重启生效，无需重启 VS Code)',
+          placeHolder:
+            '选择要切换的账号（🔥G4+Opus5.5 已置顶 | 🟢充足 🟡偏低 🔴限流冷却 ⚪免费；输入 G4 / Pro 可筛选）',
+          matchOnDescription: true,
+          matchOnDetail: true,
         });
 
         if (!chosen) {
           return;
         }
 
-        chosenEmail = chosen.account.email;
+        if (chosen.isRefreshAction) {
+          await this.refreshAllQuotas({ reopenSwitchPicker: true });
+          return;
+        }
+
+        if (!chosen.account) {
+          return;
+        }
+
+        if (chosen.account.isCurrent) {
+          const confirmSame = await vscode.window.showInformationMessage(
+            `账号 ${chosen.account.email} 已是当前激活账号，是否重新同步凭据并热重载？`,
+            '重新载入',
+            '取消'
+          );
+          if (confirmSame !== '重新载入') {
+            return;
+          }
+        }
+
+        switchArg = chosen.account.id;
+        displayEmail = chosen.account.email;
       }
 
-      vscode.window.withProgress(
+      await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `正在切换至账号 ${chosenEmail}...`,
+          title: `正在切换至账号 ${displayEmail}...`,
           cancellable: false,
         },
         async () => {
-          const res = await this.service.switchAccount(chosenEmail!);
+          const res = await this.service.switchAccount(switchArg!);
           if (res.success) {
             vscode.window.showInformationMessage(
-              `账号已成功切换为 ${chosenEmail}！已重新拉起新凭据。`
+              `账号已成功切换为 ${displayEmail}！已重新拉起新凭据。`
             );
             await this.refreshCallback();
 
@@ -313,7 +426,7 @@ export class CommandController {
                 '稍后切换'
               );
               if (action === '立即切换') {
-                await this.switchAccount(authRes.email);
+                await this.switchAccount(res.accountId || authRes.email);
               }
             } else {
               vscode.window.showErrorMessage(`导入账号失败: ${res.message}`);
@@ -391,7 +504,7 @@ export class CommandController {
               '稍后切换'
             );
             if (action === '立即切换') {
-              await this.switchAccount(finalEmail.trim());
+              await this.switchAccount(res.accountId || finalEmail.trim());
             }
           } else {
             vscode.window.showErrorMessage(`导入账号失败: ${res.message}`);

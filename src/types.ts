@@ -14,14 +14,18 @@ export interface ModelQuota {
   name: string;
   percentage: number;
   reset_time: string;
+  observed_remaining_fraction?: number;
+  quota_bucket_id?: string;
+  display_name?: string;
 }
 
 export interface AccountQuota {
   last_updated?: number;
   subscription_tier?: string | null;
   is_forbidden?: boolean;
+  forbidden_reason?: string | null;
   models?: ModelQuota[];
-  quota_groups?: QuotaGroup[] | null;
+  quota_groups?: QuotaGroup[] | Record<string, any> | null;
 }
 
 export interface AccountInfo {
@@ -32,7 +36,76 @@ export interface AccountInfo {
   disabled?: boolean;
   is_current?: boolean;
   last_used?: number | null;
+  project_id?: string | null;
+  is_gcp_tos?: boolean;
   quota?: AccountQuota | null;
+}
+
+export type AccountTierKind = 'ultra' | 'pro' | 'plus' | 'gcp' | 'paid' | 'free' | 'unknown';
+
+export type QuotaLimitReason = '5h' | 'weekly' | 'both' | null;
+
+export interface AccountSummary extends AccountInfo {
+  isCurrent: boolean;
+  isDisabled: boolean;
+  isForbidden: boolean;
+  isRateLimited: boolean;
+  isClaudeRateLimited: boolean;
+
+  tierKind: AccountTierKind;
+  tierDisplay: string;
+  isPaidTier: boolean;
+  isFreeTier: boolean;
+
+  hasGemini4: boolean;
+  hasGemini38: boolean;
+  hasClaude: boolean;
+  hasOpus: boolean;
+  hasOpus55: boolean;
+  capabilityTags: string[];
+
+  gemini5hPct: number | null;
+  geminiWeeklyPct: number | null;
+  effectiveGeminiPct: number | null;
+  gemini5hResetTime?: string;
+  geminiWeeklyResetTime?: string;
+  geminiResetTime?: string;
+  geminiLimitReason: QuotaLimitReason;
+
+  g4Pct: number | null;
+  g4FiveHourPct: number | null;
+  g4WeeklyPct: number | null;
+  g4SharesGeminiPool: boolean;
+  g4ResetTime?: string;
+
+  claude5hPct: number | null;
+  claudeWeeklyPct: number | null;
+  effectiveClaudePct: number | null;
+  claude5hResetTime?: string;
+  claudeWeeklyResetTime?: string;
+  claudeResetTime?: string;
+  claudeLimitReason: QuotaLimitReason;
+
+  imagePct: number | null;
+  imageResetTime?: string;
+
+  quotaUpdatedAt?: number;
+}
+
+export interface AccountPoolStats {
+  total: number;
+  usableGemini: number;
+  usablePaidGemini: number;
+  usableG4: number;
+  totalG4: number;
+  rateLimited: number;
+  forbidden: number;
+}
+
+export interface BatchQuotaRefreshResult {
+  total: number;
+  succeeded: number;
+  failed: number;
 }
 
 export interface TokenStatsToday {

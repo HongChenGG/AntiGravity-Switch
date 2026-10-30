@@ -3,6 +3,11 @@ import * as path from 'path';
 import * as os from 'os';
 import * as vscode from 'vscode';
 import { QuotaFamily, QuotaGroup, TokenStatsModel } from './types';
+import {
+  extractQuotaFamiliesFromRaw,
+  formatCountdownHuman,
+  isExplicitGemini4ModelName,
+} from './accountQuota';
 
 export function formatTokens(num: number | undefined | null): string {
   if (num === undefined || num === null || isNaN(num)) {
@@ -28,34 +33,11 @@ export function formatPercent(fraction: number | undefined | null): string {
   return Math.round(fraction * 100) + '%';
 }
 
-export function formatTimeRemaining(resetTimeIso: string | undefined | null): string {
-  if (!resetTimeIso) {
-    return '未知';
-  }
-  try {
-    const target = new Date(resetTimeIso).getTime();
-    if (isNaN(target)) {
-      return resetTimeIso;
-    }
-    const diffMs = target - Date.now();
-    if (diffMs <= 0) {
-      return '已重置';
-    }
-    const totalMinutes = Math.floor(diffMs / (1000 * 60));
-    const hours = Math.floor(totalMinutes / 60);
-    const mins = totalMinutes % 60;
-    if (hours >= 24) {
-      const days = Math.floor(hours / 24);
-      const remHours = hours % 24;
-      return `${days}天${remHours}小时后`;
-    }
-    if (hours > 0) {
-      return `${hours}小时${mins}分后`;
-    }
-    return `${mins}分钟后`;
-  } catch {
-    return resetTimeIso;
-  }
+export function formatTimeRemaining(
+  resetTimeIso: string | undefined | null,
+  nowMs?: number
+): string {
+  return formatCountdownHuman(resetTimeIso, nowMs);
 }
 
 export function formatDateLocal(isoString: string | undefined | null): string {
@@ -170,72 +152,14 @@ export function resolveAgySwitchPath(customPath?: string): string | null {
 }
 
 /**
- * 把 quota_groups 归纳为配额族。
+ * 把 quota_groups 归纳为配额族（同时支持数组格式与字典映射格式）。
  * 关键修复：多个 Gemini 组（例如未来出现 "Gemini 4 Models" 独立组）时，
  * 原实现会互相覆盖只剩最后一个；现在按族分别保留。
  */
 export function extractQuotaFamilies(
-  groups: QuotaGroup[] | null | undefined
+  groups: QuotaGroup[] | Record<string, any> | null | undefined
 ): QuotaFamily[] {
-  if (!groups || !groups.length) {
-    return [];
-  }
-
-  const families: QuotaFamily[] = [];
-
-  for (const group of groups) {
-    const name = (group.display_name || '').toLowerCase();
-    let key: QuotaFamily['key'] | null = null;
-
-    if (name.includes('gemini')) {
-      key = /gemini[\s\-_]*4/.test(name) ? 'gemini-4' : 'gemini';
-    } else if (name.includes('claude') || name.includes('gpt') || name.includes('3p')) {
-      key = 'claude-gpt';
-    }
-
-    if (!key) {
-      continue;
-    }
-
-    let fiveHour: number | null = null;
-    let weekly: number | null = null;
-    let fiveHourReset: string | undefined;
-    let weeklyReset: string | undefined;
-
-    for (const bucket of group.buckets || []) {
-      // bucket_id 兜底识别（如 gemini-4-5h），display_name 不规范时仍能归类
-      const bucketId = (bucket.bucket_id || '').toLowerCase();
-      if (key === 'gemini' && /gemini[\s\-_]*4/.test(bucketId)) {
-        key = 'gemini-4';
-      }
-      if (bucket.window === '5h') {
-        fiveHour = bucket.remaining_fraction;
-        fiveHourReset = bucket.reset_time;
-      } else if (bucket.window === 'weekly') {
-        weekly = bucket.remaining_fraction;
-        weeklyReset = bucket.reset_time;
-      }
-    }
-
-    const displayName =
-      key === 'gemini-4' ? 'Gemini 4' : key === 'gemini' ? 'Gemini' : 'Claude/GPT';
-
-    const existing = families.find((f) => f.key === key);
-    if (existing) {
-      if (fiveHour !== null && existing.fiveHour === null) {
-        existing.fiveHour = fiveHour;
-        existing.fiveHourReset = fiveHourReset;
-      }
-      if (weekly !== null && existing.weekly === null) {
-        existing.weekly = weekly;
-        existing.weeklyReset = weeklyReset;
-      }
-    } else {
-      families.push({ key, displayName, fiveHour, weekly, fiveHourReset, weeklyReset });
-    }
-  }
-
-  return families;
+  return extractQuotaFamiliesFromRaw(groups);
 }
 
 /** 状态栏主显族：优先基础 Gemini；只有 Gemini 4 时直接用它 */
@@ -256,7 +180,7 @@ export function pickGemini4Family(families: QuotaFamily[]): QuotaFamily | null {
 
 /** Gemini 4 模型名识别（"Gemini 4 Argon (High)" / "gemini-4-argon-trial" / Argon 代号） */
 export function isGemini4ModelName(name: string | undefined | null): boolean {
-  return /gemini[\s\-_.]*4|argon/i.test(name || '');
+  return isExplicitGemini4ModelName(name);
 }
 
 export interface Gemini4Usage {

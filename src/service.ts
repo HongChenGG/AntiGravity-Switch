@@ -1,10 +1,24 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as http from 'http';
 import * as path from 'path';
 import * as os from 'os';
 import { execFile, exec } from 'child_process';
 import { promisify } from 'util';
-import { AccountInfo, AntigravityStatus, TokenStats } from './types';
+import {
+  AccountInfo,
+  AccountQuota,
+  AccountSummary,
+  AntigravityStatus,
+  BatchQuotaRefreshResult,
+  TokenStats,
+} from './types';
+import {
+  runBoundedBatchRefresh,
+  sortAccountSummaries,
+  summarizeAccount,
+} from './accountQuota';
+import { exchangeRefreshToken, fetchAvailableModelsOnline } from './oauth';
 import { getAntigravityToolsDir, getProxyUrl, resolveAgySwitchPath } from './utils';
 
 const execFileAsync = promisify(execFile);
@@ -22,12 +36,19 @@ export class AntigravityService {
   private lastOnlineRefreshTime = 0;
   private isRefreshingOnline = false;
   private isSwitchingInternally = false;
+  private isSuppressingDirWatchNotify = false;
 
   private cachedProcessStatus: { running: boolean; pid: number | null; timestamp: number } | null = null;
   private conversationDebounceTimer: NodeJS.Timeout | null = null;
 
   private statsCache: { data: TokenStats | null; ts: number } | null = null;
   private statsInFlight: Promise<TokenStats | null> | null = null;
+
+  private accountSummariesCache: { list: AccountSummary[]; ts: number } | null = null;
+  private memoryQuotaFallback = new Map<string, AccountQuota>();
+  private batchRefreshInFlight: Promise<BatchQuotaRefreshResult> | null = null;
+  private hubEndpointsCache: { items: Array<{ port: number; csrf: string }>; ts: number } | null = null;
+  private lastHubSyncTs = 0;
 
   constructor() {
     this.updateConfig();
@@ -56,6 +77,15 @@ export class AntigravityService {
     const config = vscode.workspace.getConfiguration('antigravityStatus');
     this.customAgySwitchPath = config.get<string>('agySwitchPath', '');
     this.statsCache = null; // 配置变化后允许立刻重新拉取
+    this.accountSummariesCache = null;
+  }
+
+  public invalidateAccountsCache(): void {
+    this.accountSummariesCache = null;
+  }
+
+  public isBatchRefreshing(): boolean {
+    return this.batchRefreshInFlight !== null;
   }
 
   public getAgySwitchExecutable(): string | null {
@@ -105,7 +135,10 @@ export class AntigravityService {
       try {
         const w = fs.watch(accountsDirPath, (_eventType, filename) => {
           if (!filename || filename.toString().endsWith('.json')) {
-            this.notifyStatusChanged();
+            this.invalidateAccountsCache();
+            if (!this.isSuppressingDirWatchNotify) {
+              this.notifyStatusChanged();
+            }
           }
         });
         w.on('error', () => {
@@ -171,6 +204,7 @@ export class AntigravityService {
 
       const watcher = fs.watch(accountsJsonPath, (eventType) => {
         setTimeout(() => {
+          this.invalidateAccountsCache();
           if (fs.existsSync(accountsJsonPath)) {
             this.checkAccountChange(accountsJsonPath);
             if (eventType === 'rename') {
@@ -218,6 +252,7 @@ export class AntigravityService {
       const newId = data.current_account_id;
       if (newId && newId !== this.lastKnownAccountId) {
         this.lastKnownAccountId = newId;
+        this.invalidateAccountsCache();
         const matchingAcc = data.accounts?.find((a: any) => a.id === newId);
         const email = matchingAcc?.email || '未知账号';
         this.notifyStatusChanged();
@@ -254,7 +289,7 @@ export class AntigravityService {
         if (trimmed) {
           const pid = parseInt(trimmed.split('\n')[0], 10);
           const resPid = isNaN(pid) ? null : pid;
-          this.cachedProcessStatus = { running: true, pid: resPid, timestamp: now };
+          this.cachedProcessStatus = { running: true, pid, timestamp: now };
           return { running: true, pid: resPid };
         }
       }
@@ -305,6 +340,354 @@ export class AntigravityService {
     return data;
   }
 
+  private mergeQuotaWithMemoryFallback(
+    accountId: string,
+    diskQuota: AccountQuota | null | undefined
+  ): AccountQuota | null {
+    const mem = this.memoryQuotaFallback.get(accountId);
+    if (!mem) {
+      return diskQuota || null;
+    }
+    if (!diskQuota) {
+      return mem;
+    }
+    if ((!diskQuota.models || diskQuota.models.length === 0) && mem.models?.length) {
+      return {
+        ...diskQuota,
+        models: mem.models,
+        last_updated: mem.last_updated || diskQuota.last_updated,
+      };
+    }
+    return diskQuota;
+  }
+
+  /**
+   * 通过 agy-switch（及可选的内存级 Cloud Code 回退）向云端刷新指定账号配额
+   */
+  public async refreshAccountOnlineById(
+    accountId: string,
+    options?: { silentNotify?: boolean }
+  ): Promise<{ success: boolean; accountId: string; email?: string; error?: string }> {
+    const executable = this.getAgySwitchExecutable();
+    const toolsDir = getAntigravityToolsDir();
+    const detailPath = path.join(toolsDir, 'accounts', `${accountId}.json`);
+
+    let email: string | undefined;
+    let cliSucceeded = false;
+    let lastError: string | undefined;
+    let preservedArgonGroup: any = null;
+
+    if (fs.existsSync(detailPath)) {
+      try {
+        const preDetail = JSON.parse(fs.readFileSync(detailPath, 'utf-8'));
+        email = preDetail?.email;
+        const preGroups = preDetail?.quota?.quota_groups;
+        if (Array.isArray(preGroups)) {
+          preservedArgonGroup =
+            preGroups.find((g: any) =>
+              /argon|gemini[\s\-_.]*4/i.test(String(g?.display_name ?? g?.displayName ?? ''))
+            ) || null;
+        }
+      } catch {}
+    }
+
+    if (executable) {
+      try {
+        await execFileAsync(executable, ['refresh', accountId, '--json'], {
+          timeout: 10000,
+          encoding: 'utf-8',
+          env: this.getExecEnv(),
+        });
+        cliSucceeded = true;
+      } catch (e: any) {
+        lastError = e?.message || String(e);
+      }
+    }
+
+    // 若为当前激活账号，尝试从本地运行中的 agy.exe --hub RPC 读取独立 Gemini 4 Argon 周限额桶；
+    // 若非激活账号但此前已缓存过独立 Argon 桶且 agy-switch 未返回该组，则予以保留不被抹除。
+    const isCurrentAcc = accountId === this.getCurrentAccountId();
+    if (isCurrentAcc) {
+      await this.syncActiveAccountFromAgyHub(accountId, true).catch(() => {});
+    } else if (preservedArgonGroup && fs.existsSync(detailPath)) {
+      try {
+        const postDetail = JSON.parse(fs.readFileSync(detailPath, 'utf-8'));
+        if (Array.isArray(postDetail?.quota?.quota_groups)) {
+          const hasArgonNow = postDetail.quota.quota_groups.some((g: any) =>
+            /argon|gemini[\s\-_.]*4/i.test(String(g?.display_name ?? g?.displayName ?? ''))
+          );
+          if (!hasArgonNow) {
+            postDetail.quota.quota_groups.push(preservedArgonGroup);
+            fs.writeFileSync(detailPath, JSON.stringify(postDetail, null, 2), 'utf-8');
+          }
+        }
+      } catch {}
+    }
+
+    // 检查刷新后是否仍缺少 models（如部分 GCP Standard 账号），仅在内存中回退查询 fetchAvailableModels
+    if (fs.existsSync(detailPath)) {
+      try {
+        const detail = JSON.parse(fs.readFileSync(detailPath, 'utf-8'));
+        email = detail?.email || email;
+        const q: AccountQuota | null = detail?.quota || null;
+        const modelsEmpty = !q?.models || q.models.length === 0;
+        if (!q?.is_forbidden && modelsEmpty && detail?.token) {
+          const nowSec = Math.floor(Date.now() / 1000);
+          let accessToken: string = detail.token.access_token || '';
+          const expiry: number = detail.token.expiry_timestamp || 0;
+
+          if ((!accessToken || expiry <= nowSec + 60) && detail.token.refresh_token) {
+            try {
+              const refreshed = await exchangeRefreshToken(detail.token.refresh_token);
+              accessToken = refreshed.accessToken;
+            } catch {}
+          }
+
+          if (accessToken) {
+            const models = await fetchAvailableModelsOnline(
+              accessToken,
+              detail.token.project_id
+            );
+            if (models.length > 0) {
+              this.memoryQuotaFallback.set(accountId, {
+                ...(q || {}),
+                models,
+                last_updated: Math.floor(Date.now() / 1000),
+              });
+              cliSucceeded = true;
+            }
+          }
+        } else if (q?.models && q.models.length > 0) {
+          this.memoryQuotaFallback.delete(accountId);
+        }
+      } catch {}
+    }
+
+    this.invalidateAccountsCache();
+    if (!options?.silentNotify) {
+      this.notifyStatusChanged();
+    }
+
+    return {
+      success: cliSucceeded,
+      accountId,
+      email,
+      error: cliSucceeded ? undefined : lastError || '刷新失败',
+    };
+  }
+
+  /**
+   * 有界并发（5 Worker）批量向 Google 云端刷新全部账号剩余额度
+   */
+  public async refreshAllAccountsOnline(
+    onProgress?: (completed: number, total: number, email: string) => void
+  ): Promise<BatchQuotaRefreshResult> {
+    if (this.batchRefreshInFlight) {
+      return this.batchRefreshInFlight;
+    }
+
+    const run = async (): Promise<BatchQuotaRefreshResult> => {
+      const accounts = await this.fetchAccountsList();
+      const targets = accounts.filter((a) => !a.disabled);
+      if (targets.length === 0) {
+        return { total: 0, succeeded: 0, failed: 0 };
+      }
+
+      this.isSuppressingDirWatchNotify = true;
+      try {
+        const result = await runBoundedBatchRefresh(
+          targets,
+          (acc) => this.refreshAccountOnlineById(acc.id, { silentNotify: true }),
+          {
+            concurrency: 5,
+            onProgress,
+          }
+        );
+        return result;
+      } finally {
+        this.isSuppressingDirWatchNotify = false;
+        this.invalidateAccountsCache();
+        this.notifyStatusChanged();
+      }
+    };
+
+    this.batchRefreshInFlight = run().finally(() => {
+      this.batchRefreshInFlight = null;
+    });
+
+    return this.batchRefreshInFlight;
+  }
+
+  /**
+   * 从本地运行中的 agy.exe --hub RPC 读取最新三组配额（含独立的 Gemini 4 Argon 周限额桶 gemini-argon-wtu-weekly）
+   * 并回写至当前激活账号详情文件，弥补 agy-switch CLI 未返回 Argon 独立桶的问题。
+   */
+  public async syncActiveAccountFromAgyHub(
+    targetAccountId?: string,
+    force = false
+  ): Promise<boolean> {
+    const now = Date.now();
+    if (!force && now - this.lastHubSyncTs < 8000) {
+      return false;
+    }
+    const currentId = targetAccountId || this.getCurrentAccountId();
+    if (!currentId) {
+      return false;
+    }
+    const toolsDir = getAntigravityToolsDir();
+    const detailPath = path.join(toolsDir, 'accounts', `${currentId}.json`);
+    if (!fs.existsSync(detailPath)) {
+      return false;
+    }
+
+    this.lastHubSyncTs = now;
+    try {
+      const endpoints = await this.discoverAgyHubEndpoints();
+      if (endpoints.length === 0) {
+        return false;
+      }
+
+      const detail = JSON.parse(fs.readFileSync(detailPath, 'utf-8'));
+      const existingGroups: any[] = Array.isArray(detail?.quota?.quota_groups)
+        ? detail.quota.quota_groups
+        : [];
+      const expectedGeminiWeeklyReset = existingGroups
+        .flatMap((g: any) => (Array.isArray(g?.buckets) ? g.buckets : []))
+        .find((b: any) => String(b?.bucket_id ?? b?.bucketId ?? '') === 'gemini-weekly')
+        ?.reset_time;
+
+      for (const ep of endpoints) {
+        const groups = await this.queryAgyHubQuotaGroups(ep.port, ep.csrf);
+        if (!groups || groups.length === 0) continue;
+
+        const hubGeminiWeeklyReset = groups
+          .flatMap((g: any) => (Array.isArray(g?.buckets) ? g.buckets : []))
+          .find((b: any) => String(b?.bucketId ?? b?.bucket_id ?? '') === 'gemini-weekly')
+          ?.resetTime;
+
+        if (
+          expectedGeminiWeeklyReset &&
+          hubGeminiWeeklyReset &&
+          expectedGeminiWeeklyReset !== hubGeminiWeeklyReset
+        ) {
+          continue;
+        }
+
+        const normalizedGroups = groups.map((g: any) => ({
+          display_name: g.displayName ?? g.display_name ?? '',
+          description: g.description ?? '',
+          buckets: (Array.isArray(g.buckets) ? g.buckets : []).map((b: any) => ({
+            bucket_id: b.bucketId ?? b.bucket_id ?? '',
+            window: b.window ?? '',
+            remaining_fraction:
+              typeof b.remainingFraction === 'number'
+                ? b.remainingFraction
+                : typeof b.remaining_fraction === 'number'
+                ? b.remaining_fraction
+                : 0,
+            remaining_fraction_known: true,
+            reset_time: b.resetTime ?? b.reset_time ?? '',
+            display_name: b.displayName ?? b.display_name ?? '',
+            description: b.description ?? '',
+          })),
+        }));
+
+        if (!detail.quota || typeof detail.quota !== 'object') {
+          detail.quota = {};
+        }
+        detail.quota.quota_groups = normalizedGroups;
+        detail.quota.last_updated = Math.floor(Date.now() / 1000);
+        this.isSuppressingDirWatchNotify = true;
+        try {
+          fs.writeFileSync(detailPath, JSON.stringify(detail, null, 2), 'utf-8');
+        } finally {
+          this.isSuppressingDirWatchNotify = false;
+        }
+        this.invalidateAccountsCache();
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  private async discoverAgyHubEndpoints(): Promise<Array<{ port: number; csrf: string }>> {
+    const now = Date.now();
+    if (this.hubEndpointsCache && now - this.hubEndpointsCache.ts < 15000) {
+      return this.hubEndpointsCache.items;
+    }
+    const items: Array<{ port: number; csrf: string }> = [];
+    try {
+      let out = '';
+      if (process.platform === 'win32') {
+        const res = await execFileAsync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-Command',
+            "(Get-CimInstance Win32_Process -Filter \"Name='agy.exe'\" | Sort-Object CreationDate -Descending).CommandLine",
+          ],
+          { timeout: 3000, encoding: 'utf-8' }
+        );
+        out = res.stdout || '';
+      } else {
+        const res = await execAsync('ps -axo pid,command | grep "agy" | grep -- "--hub-port="', {
+          timeout: 2500,
+        });
+        out = res.stdout || '';
+      }
+      for (const line of out.split(/\r?\n/)) {
+        const mp = /--hub-port=(\d+)/.exec(line);
+        const mc = /--csrf_token=([a-f0-9\-]+)/i.exec(line);
+        if (mp && mc) {
+          items.push({ port: Number(mp[1]), csrf: mc[1] });
+        }
+      }
+    } catch {}
+    this.hubEndpointsCache = { items, ts: now };
+    return items;
+  }
+
+  private queryAgyHubQuotaGroups(port: number, csrf: string): Promise<any[] | null> {
+    return new Promise((resolve) => {
+      const body = '{}';
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary',
+          method: 'POST',
+          timeout: 1800,
+          headers: {
+            'Content-Type': 'application/json',
+            'Connect-Protocol-Version': '1',
+            'x-codeium-csrf-token': csrf,
+            'Content-Length': Buffer.byteLength(body),
+          },
+        },
+        (res) => {
+          let raw = '';
+          res.on('data', (chunk) => (raw += chunk));
+          res.on('end', () => {
+            try {
+              const parsed = JSON.parse(raw);
+              const groups = parsed?.response?.groups ?? parsed?.groups;
+              resolve(Array.isArray(groups) ? groups : null);
+            } catch {
+              resolve(null);
+            }
+          });
+        }
+      );
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(null);
+      });
+      req.write(body);
+      req.end();
+    });
+  }
+
   /**
    * 通过 agy-switch 在后台向 Google 云端刷新当前账号配额
    */
@@ -314,9 +697,8 @@ export class AntigravityService {
       return;
     }
 
-    const executable = this.getAgySwitchExecutable();
     const currentId = this.getCurrentAccountId();
-    if (!executable || !currentId) {
+    if (!currentId) {
       return;
     }
 
@@ -324,11 +706,7 @@ export class AntigravityService {
     this.lastOnlineRefreshTime = now;
 
     try {
-      await execFileAsync(executable, ['refresh', currentId, '--json'], {
-        timeout: 6000,
-        encoding: 'utf-8',
-        env: this.getExecEnv(),
-      });
+      await this.refreshAccountOnlineById(currentId, { silentNotify: true });
     } catch (e) {
       console.warn('Online quota refresh warning:', e);
     } finally {
@@ -354,6 +732,9 @@ export class AntigravityService {
   public async fetchStatus(): Promise<AntigravityStatus> {
     // 懒挂载：目录可能晚于插件激活才创建
     this.ensureWatchers();
+
+    // 尝试从本地运行中的 agy.exe --hub 同步最新三组配额（含独立 Gemini 4 Argon 周限额桶，内部带 8s 节流）
+    await this.syncActiveAccountFromAgyHub().catch(() => {});
 
     const processPromise = this.checkAgyProcess();
     const executable = this.getAgySwitchExecutable();
@@ -381,9 +762,12 @@ export class AntigravityService {
               id: detail.id,
               email: detail.email,
               name: detail.name,
+              disabled: Boolean(detail.disabled),
               is_current: true,
               last_used: detail.last_used,
-              quota: detail.quota,
+              project_id: detail.token?.project_id ?? null,
+              is_gcp_tos: Boolean(detail.token?.is_gcp_tos),
+              quota: this.mergeQuotaWithMemoryFallback(detail.id, detail.quota),
             };
           }
         }
@@ -393,7 +777,7 @@ export class AntigravityService {
     }
 
     // 2. 本地读不到配额时回退 CLI
-    if (!account?.quota?.quota_groups && executable) {
+    if (!account?.quota?.quota_groups && !account?.quota?.models?.length && executable) {
       try {
         const { stdout } = await execFileAsync(executable, ['quota', '--json'], {
           timeout: 4000,
@@ -448,6 +832,9 @@ export class AntigravityService {
    * 仪表盘高频轮询用这个，不要为拿个数把全部账号详情文件读一遍。
    */
   public countAccounts(): number {
+    if (this.accountSummariesCache) {
+      return this.accountSummariesCache.list.length;
+    }
     const toolsDir = getAntigravityToolsDir();
     const accountsJsonPath = path.join(toolsDir, 'accounts.json');
     try {
@@ -458,7 +845,8 @@ export class AntigravityService {
     }
   }
 
-  public async fetchAccountsList(): Promise<AccountInfo[]> {    const toolsDir = getAntigravityToolsDir();
+  public async fetchAccountsList(): Promise<AccountInfo[]> {
+    const toolsDir = getAntigravityToolsDir();
     const accountsJsonPath = path.join(toolsDir, 'accounts.json');
 
     if (fs.existsSync(accountsJsonPath)) {
@@ -470,20 +858,32 @@ export class AntigravityService {
 
         for (const a of data.accounts || []) {
           const detailPath = path.join(toolsDir, 'accounts', `${a.id}.json`);
-          let quota = null;
+          let quota: AccountQuota | null = null;
+          let disabled = Boolean(a.disabled);
+          let projectId: string | null = null;
+          let isGcpTos = false;
+
           if (fs.existsSync(detailPath)) {
             try {
               const detail = JSON.parse(fs.readFileSync(detailPath, 'utf-8'));
               quota = detail.quota || null;
+              disabled = disabled || Boolean(detail.disabled);
+              projectId = detail.token?.project_id ?? null;
+              isGcpTos = Boolean(detail.token?.is_gcp_tos);
             } catch {}
           }
+
           list.push({
             id: a.id,
             email: a.email,
             name: a.name,
+            custom_label: a.custom_label ?? null,
+            disabled,
             is_current: a.id === currentId,
             last_used: a.last_used,
-            quota,
+            project_id: projectId,
+            is_gcp_tos: isGcpTos,
+            quota: this.mergeQuotaWithMemoryFallback(a.id, quota),
           });
         }
         return list;
@@ -501,6 +901,27 @@ export class AntigravityService {
     });
     const parsed = JSON.parse(stdout);
     return Array.isArray(parsed?.accounts) ? parsed.accounts : [];
+  }
+
+  /**
+   * 获取全部账号结构化剩余额度摘要（已按智能优先级排序）。
+   * 默认带 10 秒内存缓存，并在 accounts/ 或 accounts.json 文件变动时立即失效，
+   * 保证状态栏 5s 轮询与仪表盘 4s 轮询零额外磁盘压力。
+   */
+  public async fetchAccountSummaries(forceFresh = false): Promise<AccountSummary[]> {
+    const now = Date.now();
+    if (!forceFresh && this.accountSummariesCache && now - this.accountSummariesCache.ts < 10_000) {
+      return this.accountSummariesCache.list;
+    }
+    try {
+      const rawList = await this.fetchAccountsList();
+      const summarized = rawList.map((acc) => summarizeAccount(acc, now));
+      const sorted = sortAccountSummaries(summarized);
+      this.accountSummariesCache = { list: sorted, ts: now };
+      return sorted;
+    } catch {
+      return this.accountSummariesCache ? this.accountSummariesCache.list : [];
+    }
   }
 
   public async switchAccount(
@@ -540,13 +961,10 @@ export class AntigravityService {
       // 云端配额刷新与重启后端并行：refresh 独立连 Google、不依赖 agy.exe，
       // 串行等待会白白多花最多 6 秒
       const refreshPromise = newId
-        ? execFileAsync(executable, ['refresh', newId, '--json'], {
-            timeout: 6000,
-            encoding: 'utf-8',
-            env: this.getExecEnv(),
-          }).catch(() => {})
+        ? this.refreshAccountOnlineById(newId, { silentNotify: true }).catch(() => {})
         : Promise.resolve();
       await Promise.all([refreshPromise, this.restartAgyBackend()]);
+      this.invalidateAccountsCache();
       this.notifyStatusChanged();
 
       return {
@@ -680,19 +1098,13 @@ export class AntigravityService {
     fs.writeFileSync(accountsJsonPath, JSON.stringify(accountsData, null, 2), 'utf-8');
 
     // 3. 后台触发配额刷新
-    const executable = this.getAgySwitchExecutable();
-    if (executable) {
-      try {
-        await execFileAsync(executable, ['refresh', id, '--json'], {
-          timeout: 8000,
-          encoding: 'utf-8',
-          env: this.getExecEnv(),
-        });
-      } catch (e) {
-        console.warn('Initial quota refresh for imported account:', e);
-      }
+    try {
+      await this.refreshAccountOnlineById(id, { silentNotify: true });
+    } catch (e) {
+      console.warn('Initial quota refresh for imported account:', e);
     }
 
+    this.invalidateAccountsCache();
     this.notifyStatusChanged();
 
     return {

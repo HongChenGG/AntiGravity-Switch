@@ -32,9 +32,12 @@ export function activate(context: vscode.ExtensionContext) {
     }
     isRefreshing = true;
     try {
-      const status = await service.fetchStatus();
+      const [status, poolSummaries] = await Promise.all([
+        service.fetchStatus(),
+        service.fetchAccountSummaries(),
+      ]);
       currentStatus = status;
-      statusBar.update(status);
+      statusBar.update(status, poolSummaries);
     } catch (err: any) {
       console.error('Antigravity Status fetch error:', err);
     } finally {
@@ -95,7 +98,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
   };
 
-  // Register commands
+  // Register commands (including aliases so both antigravity-status.* and antigravity.* links work)
   context.subscriptions.push(
     vscode.commands.registerCommand('antigravity-status.statusBarClicked', () =>
       commandController.statusBarClicked()
@@ -112,6 +115,12 @@ export function activate(context: vscode.ExtensionContext) {
       await refresh();
       vscode.window.showInformationMessage('反重力状态已刷新！');
     }),
+    vscode.commands.registerCommand('antigravity.refreshAllQuotas', () =>
+      commandController.refreshAllQuotas()
+    ),
+    vscode.commands.registerCommand('antigravity-status.refreshAllQuotas', () =>
+      commandController.refreshAllQuotas()
+    ),
     vscode.commands.registerCommand(
       'antigravity-status.reloadExtensionHost',
       () => commandController.reloadExtensionHost()
@@ -123,6 +132,9 @@ export function activate(context: vscode.ExtensionContext) {
       commandController.restartBackend()
     ),
     vscode.commands.registerCommand('antigravity-status.switchAccount', () =>
+      commandController.switchAccount()
+    ),
+    vscode.commands.registerCommand('antigravity.switchAccount', () =>
       commandController.switchAccount()
     ),
     vscode.commands.registerCommand('antigravity-status.importAccount', () =>

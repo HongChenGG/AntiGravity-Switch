@@ -51,6 +51,7 @@ const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const os = __importStar(require("os"));
 const vscode = __importStar(require("vscode"));
+const accountQuota_1 = require("./accountQuota");
 function formatTokens(num) {
     if (num === undefined || num === null || isNaN(num)) {
         return '0';
@@ -73,35 +74,8 @@ function formatPercent(fraction) {
     // Math.round to match official Antigravity settings page (e.g. 21%, 86%)
     return Math.round(fraction * 100) + '%';
 }
-function formatTimeRemaining(resetTimeIso) {
-    if (!resetTimeIso) {
-        return '未知';
-    }
-    try {
-        const target = new Date(resetTimeIso).getTime();
-        if (isNaN(target)) {
-            return resetTimeIso;
-        }
-        const diffMs = target - Date.now();
-        if (diffMs <= 0) {
-            return '已重置';
-        }
-        const totalMinutes = Math.floor(diffMs / (1000 * 60));
-        const hours = Math.floor(totalMinutes / 60);
-        const mins = totalMinutes % 60;
-        if (hours >= 24) {
-            const days = Math.floor(hours / 24);
-            const remHours = hours % 24;
-            return `${days}天${remHours}小时后`;
-        }
-        if (hours > 0) {
-            return `${hours}小时${mins}分后`;
-        }
-        return `${mins}分钟后`;
-    }
-    catch {
-        return resetTimeIso;
-    }
+function formatTimeRemaining(resetTimeIso, nowMs) {
+    return (0, accountQuota_1.formatCountdownHuman)(resetTimeIso, nowMs);
 }
 function formatDateLocal(isoString) {
     if (!isoString) {
@@ -204,63 +178,12 @@ function resolveAgySwitchPath(customPath) {
     return resolved;
 }
 /**
- * 把 quota_groups 归纳为配额族。
+ * 把 quota_groups 归纳为配额族（同时支持数组格式与字典映射格式）。
  * 关键修复：多个 Gemini 组（例如未来出现 "Gemini 4 Models" 独立组）时，
  * 原实现会互相覆盖只剩最后一个；现在按族分别保留。
  */
 function extractQuotaFamilies(groups) {
-    if (!groups || !groups.length) {
-        return [];
-    }
-    const families = [];
-    for (const group of groups) {
-        const name = (group.display_name || '').toLowerCase();
-        let key = null;
-        if (name.includes('gemini')) {
-            key = /gemini[\s\-_]*4/.test(name) ? 'gemini-4' : 'gemini';
-        }
-        else if (name.includes('claude') || name.includes('gpt') || name.includes('3p')) {
-            key = 'claude-gpt';
-        }
-        if (!key) {
-            continue;
-        }
-        let fiveHour = null;
-        let weekly = null;
-        let fiveHourReset;
-        let weeklyReset;
-        for (const bucket of group.buckets || []) {
-            // bucket_id 兜底识别（如 gemini-4-5h），display_name 不规范时仍能归类
-            const bucketId = (bucket.bucket_id || '').toLowerCase();
-            if (key === 'gemini' && /gemini[\s\-_]*4/.test(bucketId)) {
-                key = 'gemini-4';
-            }
-            if (bucket.window === '5h') {
-                fiveHour = bucket.remaining_fraction;
-                fiveHourReset = bucket.reset_time;
-            }
-            else if (bucket.window === 'weekly') {
-                weekly = bucket.remaining_fraction;
-                weeklyReset = bucket.reset_time;
-            }
-        }
-        const displayName = key === 'gemini-4' ? 'Gemini 4' : key === 'gemini' ? 'Gemini' : 'Claude/GPT';
-        const existing = families.find((f) => f.key === key);
-        if (existing) {
-            if (fiveHour !== null && existing.fiveHour === null) {
-                existing.fiveHour = fiveHour;
-                existing.fiveHourReset = fiveHourReset;
-            }
-            if (weekly !== null && existing.weekly === null) {
-                existing.weekly = weekly;
-                existing.weeklyReset = weeklyReset;
-            }
-        }
-        else {
-            families.push({ key, displayName, fiveHour, weekly, fiveHourReset, weeklyReset });
-        }
-    }
-    return families;
+    return (0, accountQuota_1.extractQuotaFamiliesFromRaw)(groups);
 }
 /** 状态栏主显族：优先基础 Gemini；只有 Gemini 4 时直接用它 */
 function pickPrimaryGeminiFamily(families) {
@@ -276,7 +199,7 @@ function pickGemini4Family(families) {
 }
 /** Gemini 4 模型名识别（"Gemini 4 Argon (High)" / "gemini-4-argon-trial" / Argon 代号） */
 function isGemini4ModelName(name) {
-    return /gemini[\s\-_.]*4|argon/i.test(name || '');
+    return (0, accountQuota_1.isExplicitGemini4ModelName)(name);
 }
 /** 从模型用量明细中汇总 Gemini 4 的消耗（当前 Google 未提供 G4 独立配额时的可见指标） */
 function extractGemini4Usage(models) {

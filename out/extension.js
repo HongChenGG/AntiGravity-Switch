@@ -65,9 +65,12 @@ function activate(context) {
         }
         isRefreshing = true;
         try {
-            const status = await service.fetchStatus();
+            const [status, poolSummaries] = await Promise.all([
+                service.fetchStatus(),
+                service.fetchAccountSummaries(),
+            ]);
             currentStatus = status;
-            statusBar.update(status);
+            statusBar.update(status, poolSummaries);
         }
         catch (err) {
             console.error('Antigravity Status fetch error:', err);
@@ -114,13 +117,13 @@ function activate(context) {
             }, intervalSec * 1000);
         }
     };
-    // Register commands
+    // Register commands (including aliases so both antigravity-status.* and antigravity.* links work)
     context.subscriptions.push(vscode.commands.registerCommand('antigravity-status.statusBarClicked', () => commandController.statusBarClicked()), vscode.commands.registerCommand('antigravity-status.showMenu', () => commandController.showMenu()), vscode.commands.registerCommand('antigravity-status.showDashboard', () => commandController.showDashboard()), vscode.commands.registerCommand('antigravity-status.refresh', async () => {
         // Manual refresh also triggers online cloud sync
         service.refreshCurrentAccountOnline().catch(() => { });
         await refresh();
         vscode.window.showInformationMessage('反重力状态已刷新！');
-    }), vscode.commands.registerCommand('antigravity-status.reloadExtensionHost', () => commandController.reloadExtensionHost()), vscode.commands.registerCommand('antigravity-status.reloadWindow', () => vscode.commands.executeCommand('workbench.action.reloadWindow')), vscode.commands.registerCommand('antigravity-status.restartBackend', () => commandController.restartBackend()), vscode.commands.registerCommand('antigravity-status.switchAccount', () => commandController.switchAccount()), vscode.commands.registerCommand('antigravity-status.importAccount', () => commandController.importAccount()), vscode.commands.registerCommand('antigravity-status.showDetails', () => commandController.showDashboard()), statusBar, commandController, service, vscode.workspace.onDidChangeConfiguration((e) => {
+    }), vscode.commands.registerCommand('antigravity.refreshAllQuotas', () => commandController.refreshAllQuotas()), vscode.commands.registerCommand('antigravity-status.refreshAllQuotas', () => commandController.refreshAllQuotas()), vscode.commands.registerCommand('antigravity-status.reloadExtensionHost', () => commandController.reloadExtensionHost()), vscode.commands.registerCommand('antigravity-status.reloadWindow', () => vscode.commands.executeCommand('workbench.action.reloadWindow')), vscode.commands.registerCommand('antigravity-status.restartBackend', () => commandController.restartBackend()), vscode.commands.registerCommand('antigravity-status.switchAccount', () => commandController.switchAccount()), vscode.commands.registerCommand('antigravity.switchAccount', () => commandController.switchAccount()), vscode.commands.registerCommand('antigravity-status.importAccount', () => commandController.importAccount()), vscode.commands.registerCommand('antigravity-status.showDetails', () => commandController.showDashboard()), statusBar, commandController, service, vscode.workspace.onDidChangeConfiguration((e) => {
         if (e.affectsConfiguration('antigravityStatus')) {
             service.updateConfig();
             setupTimer();

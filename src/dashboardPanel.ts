@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { AntigravityService } from './service';
 import {
+  AccountSummary,
   AntigravityStatus,
   QuotaFamily,
   StatsRangeKey,
@@ -15,11 +16,13 @@ import {
   extractQuotaFamilies,
   formatDateLocal,
   formatPercent,
+  formatTimeRemaining,
   formatTokens,
   getAntigravityToolsDir,
   isGemini4ModelName,
   localDateStr,
 } from './utils';
+import { getAccountPoolStyles, renderAccountPoolSection } from './dashboardAccountPool';
 
 const RANGE_DEFS: Array<{ key: StatsRangeKey; label: string }> = [
   { key: 'today', label: '今天' },
@@ -81,40 +84,74 @@ export class DashboardPanel {
     private service: AntigravityService,
     private onReloadRequested: () => Promise<void>,
     private onRestartBackendRequested: () => Promise<void>,
-    private onSwitchAccountRequested: () => Promise<void>,
-    private onImportAccountRequested: () => Promise<void>
+    private onSwitchAccountRequested: (targetIdOrEmail?: string) => Promise<void>,
+    private onImportAccountRequested: () => Promise<void>,
+    private onRefreshAllQuotasRequested?: () => Promise<void>
   ) {
     this.panel = panel;
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
 
     this.panel.webview.onDidReceiveMessage(
       async (message) => {
-        switch (message.command) {
-          case 'refresh':
-            await this.service.refreshCurrentAccountOnline();
-            await this.update();
-            vscode.window.showInformationMessage('仪表盘数据与云端配额已同步刷新！');
-            break;
-          case 'reloadPlugin':
-            await this.onReloadRequested();
-            break;
-          case 'restartBackend':
-            await this.onRestartBackendRequested();
-            break;
-          case 'switchAccount':
-            await this.onSwitchAccountRequested();
-            await this.update();
-            break;
-          case 'importAccount':
-            await this.onImportAccountRequested();
-            await this.update();
-            break;
-          case 'setRange':
-            if (RANGE_DEFS.some((r) => r.key === message.range)) {
-              this.currentRange = message.range as StatsRangeKey;
+        try {
+          switch (message.command) {
+            case 'refresh':
+              await this.service.refreshCurrentAccountOnline();
               await this.update();
-            }
-            break;
+              vscode.window.showInformationMessage('仪表盘数据与云端配额已同步刷新！');
+              break;
+            case 'refreshAllQuotas':
+              if (this.onRefreshAllQuotasRequested) {
+                await this.onRefreshAllQuotasRequested();
+              } else {
+                await this.service.refreshAllAccountsOnline();
+              }
+              await this.update();
+              break;
+            case 'refreshSingleAccount':
+              if (typeof message.accountId === 'string' && message.accountId.trim()) {
+                const res = await this.service.refreshAccountOnlineById(message.accountId.trim());
+                await this.update();
+                if (res.success) {
+                  vscode.window.showInformationMessage(
+                    `✅ 已刷新账号 ${res.email || message.accountId} 的最新云端额度！`
+                  );
+                } else {
+                  vscode.window.showWarningMessage(
+                    `刷新账号失败 (${res.email || message.accountId}): ${res.error || '未知错误'}`
+                  );
+                }
+              }
+              break;
+            case 'reloadPlugin':
+              await this.onReloadRequested();
+              break;
+            case 'restartBackend':
+              await this.onRestartBackendRequested();
+              break;
+            case 'switchAccount':
+              await this.onSwitchAccountRequested();
+              await this.update();
+              break;
+            case 'switchToAccount':
+              if (typeof message.accountId === 'string' && message.accountId.trim()) {
+                await this.onSwitchAccountRequested(message.accountId.trim());
+                await this.update();
+              }
+              break;
+            case 'importAccount':
+              await this.onImportAccountRequested();
+              await this.update();
+              break;
+            case 'setRange':
+              if (RANGE_DEFS.some((r) => r.key === message.range)) {
+                this.currentRange = message.range as StatsRangeKey;
+                await this.update();
+              }
+              break;
+          }
+        } catch (err: any) {
+          vscode.window.showErrorMessage(`仪表盘操作失败: ${err?.message || String(err)}`);
         }
       },
       null,
@@ -144,14 +181,20 @@ export class DashboardPanel {
     service: AntigravityService,
     onReloadRequested: () => Promise<void>,
     onRestartBackendRequested: () => Promise<void>,
-    onSwitchAccountRequested: () => Promise<void>,
-    onImportAccountRequested: () => Promise<void>
+    onSwitchAccountRequested: (targetIdOrEmail?: string) => Promise<void>,
+    onImportAccountRequested: () => Promise<void>,
+    onRefreshAllQuotasRequested?: () => Promise<void>
   ): DashboardPanel {
     const column = vscode.window.activeTextEditor
       ? vscode.window.activeTextEditor.viewColumn
       : undefined;
 
     if (DashboardPanel.currentPanel) {
+      DashboardPanel.currentPanel.onReloadRequested = onReloadRequested;
+      DashboardPanel.currentPanel.onRestartBackendRequested = onRestartBackendRequested;
+      DashboardPanel.currentPanel.onSwitchAccountRequested = onSwitchAccountRequested;
+      DashboardPanel.currentPanel.onImportAccountRequested = onImportAccountRequested;
+      DashboardPanel.currentPanel.onRefreshAllQuotasRequested = onRefreshAllQuotasRequested;
       DashboardPanel.currentPanel.panel.reveal(column);
       DashboardPanel.currentPanel.update();
       return DashboardPanel.currentPanel;
@@ -173,7 +216,8 @@ export class DashboardPanel {
       onReloadRequested,
       onRestartBackendRequested,
       onSwitchAccountRequested,
-      onImportAccountRequested
+      onImportAccountRequested,
+      onRefreshAllQuotasRequested
     );
     return DashboardPanel.currentPanel;
   }
@@ -198,15 +242,18 @@ export class DashboardPanel {
     }
     this.isUpdating = true;
     try {
-      const status = await this.service.fetchStatus();
+      const [status, accountSummaries] = await Promise.all([
+        this.service.fetchStatus(),
+        this.service.fetchAccountSummaries(),
+      ]);
       const pricing = this.loadPricing();
-      const totalAccounts = this.service.countAccounts();
+      const totalAccounts = accountSummaries.length || this.service.countAccounts();
 
       if (this.disposed) {
         return;
       }
 
-      const html = this.renderHtml(status, pricing, totalAccounts);
+      const html = this.renderHtml(status, pricing, totalAccounts, accountSummaries);
       if (html !== this.lastHtml) {
         this.panel.webview.html = html;
         this.lastHtml = html;
@@ -281,7 +328,8 @@ export class DashboardPanel {
   private renderHtml(
     status: AntigravityStatus,
     pricing: Record<string, { input: number; output: number; cached: number }>,
-    totalAccounts: number
+    totalAccounts: number,
+    accountSummaries: AccountSummary[] = []
   ): string {
     const rangeKey = this.currentRange;
     const rangeLabel = rangeLabelOf(rangeKey);
@@ -343,55 +391,89 @@ export class DashboardPanel {
 
     const pct = (f: number | null | undefined) =>
       f === null || f === undefined ? '--' : formatPercent(f);
-    const usedPct = (f: number | null | undefined) =>
-      f === null || f === undefined
-        ? 0
-        : Math.max(0, Math.min(100, Math.round((1 - f) * 100)));
+    const remainPct = (f: number | null | undefined) =>
+      f === null || f === undefined ? 0 : Math.max(0, Math.min(100, Math.round(f * 100)));
 
     const quotaRowsHtml = families.length
       ? families
-          .map(
-            (f) => `
+          .map((f) => {
+            const fiveRow =
+              f.fiveHour !== null
+                ? `
             <div class="progress-row">
               <span>${escapeHtml(f.displayName)} 5h:</span>
-              <span><strong>${pct(f.fiveHour)}</strong></span>
+              <span><strong>${pct(f.fiveHour)}</strong>${
+                    f.fiveHourReset
+                      ? ` <span style="color:var(--text-muted);font-size:10px;">(⏳${escapeHtml(
+                          formatTimeRemaining(f.fiveHourReset)
+                        )})</span>`
+                      : ''
+                  }</span>
             </div>
             <div class="progress-bar">
-              <div class="progress-fill-cyan" style="width: ${usedPct(f.fiveHour)}%;"></div>
-            </div>
+              <div class="progress-fill-cyan" style="width: ${remainPct(f.fiveHour)}%;"></div>
+            </div>`
+                : '';
+            const weekRow =
+              f.weekly !== null
+                ? `
             <div class="progress-row">
               <span>${escapeHtml(f.displayName)} 周:</span>
-              <span><strong>${pct(f.weekly)}</strong></span>
+              <span><strong>${pct(f.weekly)}</strong>${
+                    f.weeklyReset
+                      ? ` <span style="color:var(--text-muted);font-size:10px;">(⏳${escapeHtml(
+                          formatTimeRemaining(f.weeklyReset)
+                        )})</span>`
+                      : ''
+                  }</span>
             </div>
             <div class="progress-bar">
-              <div class="progress-fill-amber" style="width: ${usedPct(f.weekly)}%;"></div>
-            </div>
-          `
-          )
+              <div class="progress-fill-amber" style="width: ${remainPct(f.weekly)}%;"></div>
+            </div>`
+                : '';
+            return fiveRow + weekRow;
+          })
           .join('')
       : '<div class="kpi-sub">暂无配额数据</div>';
 
     let g4CardHtml = '';
     if (showG4Card) {
       if (gemini4) {
-        // Google 已提供 G4 独立配额组：显示配额进度条，附带用量
+        // Google 已提供 G4 Argon 独立周限额组（不与 Gemini 3.8 共享）
+        const g4FiveHtml =
+          gemini4.fiveHour !== null
+            ? `
+              <div class="progress-row">
+                <span>5小时剩余:</span>
+                <span><strong>${pct(gemini4.fiveHour)}</strong>${
+                gemini4.fiveHourReset
+                  ? ` <span style="color:var(--text-muted);font-size:10px;">(⏳${escapeHtml(
+                      formatTimeRemaining(gemini4.fiveHourReset)
+                    )})</span>`
+                  : ''
+              }</span>
+              </div>
+              <div class="progress-bar">
+                <div class="progress-fill-cyan" style="width: ${remainPct(gemini4.fiveHour)}%;"></div>
+              </div>`
+            : '';
         g4CardHtml = `
           <div class="kpi-card" style="border-color: rgba(139, 92, 246, 0.45);">
-            <div class="kpi-title">🆕 Gemini 4 额度</div>
+            <div class="kpi-title">🔥 Gemini 4 Argon 独立额度</div>
             <div class="progress-group">
+              ${g4FiveHtml}
               <div class="progress-row">
-                <span>5小时:</span>
-                <span><strong>${pct(gemini4.fiveHour)}</strong></span>
+                <span>独立周限额剩余:</span>
+                <span><strong>${pct(gemini4.weekly)}</strong>${
+          gemini4.weeklyReset
+            ? ` <span style="color:var(--text-muted);font-size:10px;">(⏳${escapeHtml(
+                formatTimeRemaining(gemini4.weeklyReset)
+              )})</span>`
+            : ''
+        }</span>
               </div>
               <div class="progress-bar">
-                <div class="progress-fill-cyan" style="width: ${usedPct(gemini4.fiveHour)}%;"></div>
-              </div>
-              <div class="progress-row">
-                <span>周限额:</span>
-                <span><strong>${pct(gemini4.weekly)}</strong></span>
-              </div>
-              <div class="progress-bar">
-                <div class="progress-fill-amber" style="width: ${usedPct(gemini4.weekly)}%;"></div>
+                <div class="progress-fill-cyan" style="width: ${remainPct(gemini4.weekly)}%;"></div>
               </div>
             </div>
             <div class="kpi-sub">${
@@ -399,20 +481,19 @@ export class DashboardPanel {
                 ? `${rangeLabel}用量 ${formatTokens(g4UsageTokens)}${
                     g4UsageShare !== null ? ` (${g4UsageShare}%)` : ''
                   } · $${g4UsageCost.toFixed(2)}`
-                : '独立配额组'
+                : 'Pro 独立周限额池 (不与 Gemini 3.8 共享)'
             }</div>
           </div>
         `;
       } else {
-        // 暂无独立配额组：显示 G4 用量，并注明额度计入 Gemini 组
         g4CardHtml = `
           <div class="kpi-card" style="border-color: rgba(139, 92, 246, 0.45);">
-            <div class="kpi-title">🆕 Gemini 4 用量</div>
+            <div class="kpi-title">🔥 Gemini 4 用量</div>
             <div class="kpi-value">${formatTokens(g4UsageTokens)}</div>
             <div class="kpi-sub">${rangeLabel} · 占总用量 ${
           g4UsageShare !== null ? `${g4UsageShare}%` : '--'
         } · ${g4UsageReq.toLocaleString()} 次请求 · $${g4UsageCost.toFixed(2)}</div>
-            <div class="kpi-sub" style="margin-top:4px;">额度暂计入 Gemini 组（Google 未提供 G4 独立配额，开放后此处自动显示）</div>
+            <div class="kpi-sub" style="margin-top:4px;">Pro 灰度账号拥有独立 Gemini 4 Argon 周限额池（点右上角刷新数据即可同步余量）</div>
           </div>
         `;
       }
@@ -929,6 +1010,7 @@ export class DashboardPanel {
             font-size: 11px;
             color: #64748b;
           }
+          ${getAccountPoolStyles()}
         </style>
       </head>
       <body>
@@ -940,10 +1022,11 @@ export class DashboardPanel {
           </div>
           <div class="nav-actions">
             <button class="btn-action" onclick="postCmd('importAccount')">➕ 导入账号 (Token)</button>
-            <button class="btn-action" onclick="postCmd('switchAccount')">👥 切换账号</button>
+            <button class="btn-action" onclick="postCmd('switchAccount')">👥 弹窗切号</button>
+            <button class="btn-action" onclick="postCmd('refreshAllQuotas')">🔄 刷新全池额度</button>
             <button class="btn-action" onclick="postCmd('reloadPlugin')">⚡ 热重启插件</button>
             <button class="btn-action" onclick="postCmd('restartBackend')">🔌 冷重启核心</button>
-            <button class="btn-action btn-primary" onclick="postCmd('refresh')">🔄 刷新数据</button>
+            <button class="btn-action btn-primary" onclick="postCmd('refresh')">🔄 刷新当前</button>
           </div>
         </div>
 
@@ -1027,6 +1110,9 @@ export class DashboardPanel {
           </div>
         </div>
 
+        <!-- Account Pool Remaining Quotas & One-Click Switch -->
+        ${renderAccountPoolSection(accountSummaries)}
+
         <!-- Middle Charts Row -->
         <div class="charts-row">
           <div class="chart-card">
@@ -1090,6 +1176,35 @@ export class DashboardPanel {
           function setRange(range) {
             vscode.postMessage({ command: 'setRange', range });
           }
+          function setPoolFilter(filterKey) {
+            const prev = vscode.getState() || {};
+            vscode.setState({ ...prev, poolFilter: filterKey });
+            document.querySelectorAll('.ag-filter-btn').forEach((btn) => {
+              btn.classList.toggle('active', btn.getAttribute('data-pool-filter') === filterKey);
+            });
+            document.querySelectorAll('.ag-pool-row').forEach((row) => {
+              const tags = (row.getAttribute('data-filters') || '').split(' ');
+              row.style.display = filterKey === 'all' || tags.includes(filterKey) ? '' : 'none';
+            });
+          }
+          document.addEventListener('click', (e) => {
+            const btn = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
+            if (!btn) return;
+            const action = btn.getAttribute('data-action');
+            const accountId = btn.getAttribute('data-account-id');
+            if (!accountId) return;
+            if (action === 'switch-acc') {
+              vscode.postMessage({ command: 'switchToAccount', accountId });
+            } else if (action === 'refresh-one') {
+              vscode.postMessage({ command: 'refreshSingleAccount', accountId });
+            }
+          });
+          (function restorePoolFilter() {
+            const saved = vscode.getState();
+            if (saved && saved.poolFilter && saved.poolFilter !== 'all') {
+              setPoolFilter(saved.poolFilter);
+            }
+          })();
         </script>
       </body>
       </html>
