@@ -340,25 +340,101 @@ export class AntigravityService {
     return data;
   }
 
+  private getG4ArgonPersistentGroup(accountId: string): any | null {
+    try {
+      const toolsDir = getAntigravityToolsDir();
+      const p = path.join(toolsDir, 'g4_argon_quotas.json');
+      if (fs.existsSync(p)) {
+        const data = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        const info = data[accountId];
+        if (
+          info &&
+          (info.bucket_id === 'gemini-argon-wtu-weekly' ||
+            info.bucketId === 'gemini-argon-wtu-weekly')
+        ) {
+          return {
+            display_name: 'Gemini 4 Argon',
+            description: 'For paid Pro plans, Argon quota is separate.',
+            buckets: [
+              {
+                bucket_id: 'gemini-argon-wtu-weekly',
+                window: info.window || 'weekly',
+                remaining_fraction:
+                  typeof info.remaining_fraction === 'number'
+                    ? info.remaining_fraction
+                    : info.remainingFraction ?? 0,
+                reset_time: info.reset_time || info.resetTime || '',
+                display_name: 'Gemini 4 Argon Weekly Limit',
+              },
+            ],
+          };
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  private saveG4ArgonPersistentGroup(accountId: string, email: string, bucket: any): void {
+    try {
+      const toolsDir = getAntigravityToolsDir();
+      const p = path.join(toolsDir, 'g4_argon_quotas.json');
+      let data: Record<string, any> = {};
+      if (fs.existsSync(p)) {
+        try {
+          data = JSON.parse(fs.readFileSync(p, 'utf-8')) || {};
+        } catch {}
+      }
+      data[accountId] = {
+        email,
+        bucket_id: 'gemini-argon-wtu-weekly',
+        window: bucket.window || 'weekly',
+        remaining_fraction:
+          typeof bucket.remaining_fraction === 'number'
+            ? bucket.remaining_fraction
+            : bucket.remainingFraction ?? 0,
+        reset_time: bucket.reset_time || bucket.resetTime || '',
+        recorded_at: Math.floor(Date.now() / 1000),
+      };
+      fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf-8');
+    } catch {}
+  }
+
   private mergeQuotaWithMemoryFallback(
     accountId: string,
     diskQuota: AccountQuota | null | undefined
   ): AccountQuota | null {
     const mem = this.memoryQuotaFallback.get(accountId);
-    if (!mem) {
-      return diskQuota || null;
+    let result = diskQuota || null;
+    if (mem) {
+      if (!result) {
+        result = mem;
+      } else if ((!result.models || result.models.length === 0) && mem.models?.length) {
+        result = {
+          ...result,
+          models: mem.models,
+          last_updated: mem.last_updated || result.last_updated,
+        };
+      }
     }
-    if (!diskQuota) {
-      return mem;
+
+    // 若账号未包含已持久化的 Argon 配额组，且在 g4_argon_quotas.json 中有记录，则合并
+    const diskGroups = result?.quota_groups;
+    if (Array.isArray(diskGroups)) {
+      const hasArgon = diskGroups.some((g: any) =>
+        /argon|gemini[\s\-_.]*4/i.test(String(g?.display_name ?? g?.displayName ?? ''))
+      );
+      if (!hasArgon) {
+        const persistentArgon = this.getG4ArgonPersistentGroup(accountId);
+        if (persistentArgon) {
+          result = {
+            ...(result || {}),
+            quota_groups: [...diskGroups, persistentArgon],
+          };
+        }
+      }
     }
-    if ((!diskQuota.models || diskQuota.models.length === 0) && mem.models?.length) {
-      return {
-        ...diskQuota,
-        models: mem.models,
-        last_updated: mem.last_updated || diskQuota.last_updated,
-      };
-    }
-    return diskQuota;
+
+    return result;
   }
 
   /**
@@ -406,10 +482,11 @@ export class AntigravityService {
 
     // 若为当前激活账号，尝试从本地运行中的 agy.exe --hub RPC 读取独立 Gemini 4 Argon 周限额桶；
     // 若非激活账号但此前已缓存过独立 Argon 桶且 agy-switch 未返回该组，则予以保留不被抹除。
+    const argonToRestore = preservedArgonGroup || this.getG4ArgonPersistentGroup(accountId);
     const isCurrentAcc = accountId === this.getCurrentAccountId();
     if (isCurrentAcc) {
       await this.syncActiveAccountFromAgyHub(accountId, true).catch(() => {});
-    } else if (preservedArgonGroup && fs.existsSync(detailPath)) {
+    } else if (argonToRestore && fs.existsSync(detailPath)) {
       try {
         const postDetail = JSON.parse(fs.readFileSync(detailPath, 'utf-8'));
         if (Array.isArray(postDetail?.quota?.quota_groups)) {
@@ -417,7 +494,7 @@ export class AntigravityService {
             /argon|gemini[\s\-_.]*4/i.test(String(g?.display_name ?? g?.displayName ?? ''))
           );
           if (!hasArgonNow) {
-            postDetail.quota.quota_groups.push(preservedArgonGroup);
+            postDetail.quota.quota_groups.push(argonToRestore);
             fs.writeFileSync(detailPath, JSON.stringify(postDetail, null, 2), 'utf-8');
           }
         }
@@ -591,6 +668,13 @@ export class AntigravityService {
             description: b.description ?? '',
           })),
         }));
+
+        const argonBucket = normalizedGroups
+          .flatMap((g: any) => (Array.isArray(g?.buckets) ? g.buckets : []))
+          .find((b: any) => String(b?.bucket_id ?? '').includes('argon'));
+        if (argonBucket && detail.email) {
+          this.saveG4ArgonPersistentGroup(currentId, detail.email, argonBucket);
+        }
 
         if (!detail.quota || typeof detail.quota !== 'object') {
           detail.quota = {};
