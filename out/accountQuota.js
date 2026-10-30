@@ -639,19 +639,24 @@ function summarizeAccount(account, nowMs = Date.now()) {
             (effectiveGeminiPct === null && finalG4Pct !== null && finalG4Pct <= 0));
     const isClaudeRateLimited = !isForbidden && effectiveClaudePct !== null && effectiveClaudePct <= 0;
     const capabilityTags = [];
-    if (hasGemini4)
-        capabilityTags.push('G4');
-    if (hasOpus55) {
-        capabilityTags.push('Opus 5.5');
+    if (tierInfo.isFreeTier) {
+        capabilityTags.push('Starter 体验');
     }
-    else if (hasOpus) {
-        capabilityTags.push('Opus');
+    else {
+        if (hasGemini4)
+            capabilityTags.push('G4');
+        if (hasOpus55) {
+            capabilityTags.push('Opus 5.5');
+        }
+        else if (hasOpus) {
+            capabilityTags.push('Opus');
+        }
+        else if (hasClaude) {
+            capabilityTags.push('Claude');
+        }
+        if (hasGemini38)
+            capabilityTags.push('3.8');
     }
-    else if (hasClaude) {
-        capabilityTags.push('Claude');
-    }
-    if (hasGemini38)
-        capabilityTags.push('3.8');
     return {
         ...account,
         isCurrent: Boolean(account.is_current),
@@ -663,11 +668,11 @@ function summarizeAccount(account, nowMs = Date.now()) {
         tierDisplay: tierInfo.tierDisplay,
         isPaidTier: tierInfo.isPaidTier,
         isFreeTier: tierInfo.isFreeTier,
-        hasGemini4,
-        hasGemini38,
+        hasGemini4: tierInfo.isFreeTier ? false : hasGemini4,
+        hasGemini38: tierInfo.isFreeTier ? false : hasGemini38,
         hasClaude,
-        hasOpus,
-        hasOpus55,
+        hasOpus: tierInfo.isFreeTier ? false : hasOpus,
+        hasOpus55: tierInfo.isFreeTier ? false : hasOpus55,
         capabilityTags,
         gemini5hPct,
         geminiWeeklyPct,
@@ -797,10 +802,28 @@ function computePoolStats(summaries) {
     let totalG4 = 0;
     let rateLimited = 0;
     let forbidden = 0;
+    let freeTotal = 0;
+    let usableFree = 0;
+    let proTotal = 0;
+    let usablePro = 0;
     for (const s of summaries) {
         if (s.isForbidden || s.isDisabled) {
             forbidden++;
             continue;
+        }
+        if (s.isFreeTier) {
+            freeTotal++;
+            if ((s.effectiveGeminiPct ?? 0) > 0) {
+                usableFree++;
+                usableGemini++;
+            }
+            continue;
+        }
+        proTotal++;
+        const isPaidUsable = (s.effectiveGeminiPct !== null && s.effectiveGeminiPct > 0) ||
+            (s.g4Pct !== null && s.g4Pct > 0);
+        if (isPaidUsable) {
+            usablePro++;
         }
         if (s.hasGemini4) {
             totalG4++;
@@ -829,6 +852,10 @@ function computePoolStats(summaries) {
         totalG4,
         rateLimited,
         forbidden,
+        freeTotal,
+        usableFree,
+        proTotal,
+        usablePro,
     };
 }
 /**
@@ -894,9 +921,11 @@ function formatAccountQuickPickDisplay(acc, nowMs = Date.now()) {
     const statusEmoji = getAccountStatusEmoji(acc);
     const g4Prefix = acc.hasGemini4 ? '🔥 ' : '';
     const label = `${statusEmoji} ${g4Prefix}${acc.email}${acc.isCurrent ? '  (当前)' : ''}`;
-    const tierTag = acc.hasGemini4
-        ? `[🔥G4${acc.hasOpus55 ? '+Opus5.5' : ''} · ${acc.tierDisplay}]`
-        : `[${acc.tierDisplay}${acc.hasOpus ? ' · Opus' : ''}]`;
+    const tierTag = acc.isFreeTier
+        ? `[${acc.tierDisplay}]`
+        : acc.hasGemini4
+            ? `[🔥G4${acc.hasOpus55 ? '+Opus5.5' : ''} · ${acc.tierDisplay}]`
+            : `[${acc.tierDisplay}${acc.hasOpus ? ' · Opus' : ''}]`;
     let description;
     if (acc.isForbidden) {
         description = `🚫 账号受限/无权限 (Forbidden) · [${acc.tierDisplay}]`;
@@ -923,11 +952,11 @@ function formatAccountQuickPickDisplay(acc, nowMs = Date.now()) {
         description = `${tierTag} · ${g4PrefixInfo}${headName}: 🔴 0% (${limitLabel} · ⏳${countdown}${localTime})`;
     }
     else if (acc.isFreeTier) {
-        const gPart = acc.effectiveGeminiPct !== null ? `生图/Lite: ${acc.effectiveGeminiPct}%(周)` : '未同步';
+        const gPart = acc.effectiveGeminiPct !== null ? `Flash: ${acc.effectiveGeminiPct}%(周)` : '未同步';
         const rPart = acc.geminiResetTime
             ? ` · ⏳${formatCountdownCompact(acc.geminiResetTime, nowMs)}后重置`
             : '';
-        description = `[${acc.tierDisplay}] ${gPart}${rPart}`;
+        description = `[${acc.tierDisplay} 免费体验] ${gPart}${rPart}`;
     }
     else {
         const g4Seg = acc.hasGemini4 && acc.g4Pct !== null

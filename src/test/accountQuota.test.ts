@@ -836,6 +836,10 @@ test('5.1 sortAccountSummaries & computePoolStats: full priority ordering and ac
     totalG4: 3,
     rateLimited: 4,
     forbidden: 2,
+    freeTotal: 1,
+    usableFree: 1,
+    proTotal: 8,
+    usablePro: 4,
   });
 });
 

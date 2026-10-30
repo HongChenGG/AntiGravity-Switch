@@ -100,6 +100,10 @@ export interface AccountPoolStats {
   totalG4: number;
   rateLimited: number;
   forbidden: number;
+  freeTotal: number;
+  usableFree: number;
+  proTotal: number;
+  usablePro: number;
 }
 
 export interface BatchQuotaRefreshResult {

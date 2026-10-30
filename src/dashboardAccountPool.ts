@@ -236,15 +236,11 @@ function renderGemini38Cell(acc: AccountSummary, nowMs: number): string {
 
       <div class="ag-quota-top">
 
-        <span class="ag-window-pair">
-
-          5h <strong class="${pctTextClass(acc.gemini5hPct)}">${p5}</strong>
-
-          <span class="ag-sep">·</span>
-
-          周 <strong class="${pctTextClass(acc.geminiWeeklyPct)}">${pw}</strong>
-
-        </span>
+        ${
+          acc.isFreeTier
+            ? `<span class="ag-window-pair"><span class="ag-pill ag-pill-free" style="font-size:10px;margin-right:4px;">Flash</span>周 <strong class="${pctTextClass(acc.geminiWeeklyPct)}">${pw}</strong></span>`
+            : `<span class="ag-window-pair">5h <strong class="${pctTextClass(acc.gemini5hPct)}">${p5}</strong><span class="ag-sep">·</span>周 <strong class="${pctTextClass(acc.geminiWeeklyPct)}">${pw}</strong></span>`
+        }
 
         ${limitTag}
 
@@ -288,14 +284,12 @@ function renderClaudeCell(acc: AccountSummary, nowMs: number): string {
 
   const pw = acc.claudeWeeklyPct !== null ? `${acc.claudeWeeklyPct}%` : '--';
 
-  const modelBadge = acc.hasOpus55
-
+  const modelBadge = acc.isFreeTier
+    ? '<span class="ag-pill ag-pill-free">Starter 体验</span>'
+    : acc.hasOpus55
     ? '<span class="ag-pill ag-pill-opus55">Opus 5.5</span>'
-
     : acc.hasOpus
-
     ? '<span class="ag-pill ag-pill-opus46">Opus 4.6</span>'
-
     : '<span class="ag-pill ag-pill-opus46">Claude</span>';
 
   const resetIso = acc.claudeWeeklyResetTime || acc.claudeResetTime || acc.claude5hResetTime;
@@ -490,6 +484,21 @@ export function getAccountPoolStyles(): string {
       background: rgba(148, 163, 184, 0.15);
       color: #cbd5e1;
       border: 1px solid rgba(148, 163, 184, 0.35);
+    }
+
+    .ag-pill-free {
+      background: rgba(148, 163, 184, 0.12);
+      color: #94a3b8;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+    }
+
+    .ag-section-row td {
+      background: rgba(15, 23, 42, 0.65) !important;
+      padding: 9px 16px !important;
+      font-size: 12px;
+      font-weight: 700;
+      border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
     }
 
     .ag-pool-toolbar {
@@ -1008,161 +1017,127 @@ export function renderAccountPoolSection(
 
   const coolingCount = summaries.filter((a) => a.isRateLimited && !a.isDisabled && !a.isForbidden).length;
 
-  const rowsHtml =
-
-    summaries.length === 0
-
-      ? `<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:24px;">未检测到本地账号，请点击右上角「➕ 导入账号」</td></tr>`
-
-      : summaries
-
-          .map((acc) => {
-
-            const filterList = classifyAccountPoolFilters(acc).join(' ');
-
-            const emoji = getAccountStatusEmoji(acc);
-
-            const rowClasses = [
-
-              'ag-pool-row',
-
-              acc.isCurrent ? 'ag-row-current' : '',
-
-              acc.isRateLimited ? 'ag-row-cooling' : '',
-
-            ]
-
-              .filter(Boolean)
-
-              .join(' ');
-
-            const tierClass = acc.hasGemini4
-
-              ? 'ag-tier-tag ag-tier-g4'
-
-              : acc.isFreeTier
-
-              ? 'ag-tier-tag ag-tier-free'
-
-              : acc.isPaidTier
-
-              ? 'ag-tier-tag ag-tier-pro'
-
-              : 'ag-tier-tag';
-
-            const currentBadge = acc.isCurrent
-
-              ? '<span class="ag-pill ag-pill-current">⭐ 当前 IDE</span>'
-
-              : '';
-
-            const customLabel = acc.custom_label
-
-              ? `<span class="ag-pill" style="background:rgba(255,255,255,0.08);color:#cbd5e1;">${escapeHtml(
-
-                  acc.custom_label
-
-                )}</span>`
-
-              : '';
-
-            const updatedStr = acc.quotaUpdatedAt
-
-              ? `同步于 ${escapeHtml(
-
-                  formatShortLocalResetTime(new Date(acc.quotaUpdatedAt * 1000).toISOString(), nowMs)
-
-                )}`
-
-              : '';
-
-            const safeId = escapeHtml(acc.id);
-
-            const safeEmail = escapeHtml(acc.email);
-
-            const actionHtml = acc.isCurrent
-
-              ? `
-
-                <div class="ag-actions-cell">
-
-                  <span class="ag-badge-active">✓ 当前激活</span>
-
-                  <button class="ag-btn-icon" data-action="refresh-one" data-account-id="${safeId}" title="刷新此账号最新云端额度">↻</button>
-
-                </div>
-
-              `
-
-              : `
-
-                <div class="ag-actions-cell">
-
-                  <button class="ag-btn-switch" data-action="switch-acc" data-account-id="${safeId}" title="一键切换到 ${safeEmail}">⚡ 切换</button>
-
-                  <button class="ag-btn-icon" data-action="refresh-one" data-account-id="${safeId}" title="单独刷新 ${safeEmail} 的最新额度">↻</button>
-
-                </div>
-
-              `;
-
-            return `
-
-              <tr class="${rowClasses}" data-filters="${escapeHtml(filterList)}">
-
-                <td>
-
-                  <div class="ag-acc-main">
-
-                    <span>${emoji}</span>
-
-                    <span>${safeEmail}</span>
-
-                    ${currentBadge}
-
-                    ${customLabel}
-
-                  </div>
-
-                  <div class="ag-acc-meta">
-
-                    <span class="${tierClass}">${escapeHtml(acc.tierDisplay)}</span>
-
-                    ${
-
-                      acc.hasGemini4
-
-                        ? '<span class="ag-pill ag-pill-g4">G4 Argon + Opus 5.5</span>'
-
-                        : acc.hasGemini38
-
-                        ? '<span style="color:#94a3b8;">Gemini 3.8 + Opus 4.6</span>'
-
-                        : ''
-
-                    }
-
-                    ${updatedStr ? `<span>· ${updatedStr}</span>` : ''}
-
-                  </div>
-
-                </td>
-
-                <td>${renderG4Cell(acc, nowMs)}</td>
-
-                <td>${renderGemini38Cell(acc, nowMs)}</td>
-
-                <td>${renderClaudeCell(acc, nowMs)}</td>
-
-                <td>${actionHtml}</td>
-
-              </tr>
-
-            `;
-
-          })
-
-          .join('');
+  let hasRenderedProSection = false;
+  let hasRenderedFreeSection = false;
+  let hasRenderedDisabledSection = false;
+
+  const rowsList: string[] = [];
+  if (summaries.length === 0) {
+    rowsList.push('<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:24px;">未检测到本地账号，请点击右上角「➕ 导入账号」</td></tr>');
+  } else {
+    for (const acc of summaries) {
+      if (!hasRenderedProSection && !acc.isFreeTier && !acc.isForbidden && !acc.isDisabled) {
+        hasRenderedProSection = true;
+        rowsList.push(`
+          <tr class="ag-pool-row ag-section-row" data-filters="all g4 pro">
+            <td colspan="5">
+              <div style="display:flex;align-items:center;justify-content:space-between;">
+                <span style="color:#38bdf8;">💎 付费 Pro / G4 账号池 (共 ${g4Total + proTotal} 个 · 可用 ${g4Usable + proUsable} 个)</span>
+                <span style="font-size:11px;font-weight:normal;color:var(--text-muted);">支持 Gemini 3.8 / 4.0 / Opus 5.5 / 4.6</span>
+              </div>
+            </td>
+          </tr>
+        `);
+      } else if (!hasRenderedFreeSection && acc.isFreeTier) {
+        hasRenderedFreeSection = true;
+        rowsList.push(`
+          <tr class="ag-pool-row ag-section-row" data-filters="all free">
+            <td colspan="5">
+              <div style="display:flex;align-items:center;justify-content:space-between;">
+                <span style="color:#94a3b8;">🆓 免费体验账号池 (Starter · 共 ${freeTotal} 个 · 可用 ${freeUsable} 个)</span>
+                <span style="font-size:11px;font-weight:normal;color:var(--text-muted);">基础体验配额 · 无独立 G4 / Opus 5.5 配额池</span>
+              </div>
+            </td>
+          </tr>
+        `);
+      } else if (!hasRenderedDisabledSection && (acc.isForbidden || acc.isDisabled)) {
+        hasRenderedDisabledSection = true;
+        rowsList.push(`
+          <tr class="ag-pool-row ag-section-row" data-filters="all">
+            <td colspan="5">
+              <div style="display:flex;align-items:center;justify-content:space-between;">
+                <span style="color:#ef4444;">🚫 受限 / 已禁用账号</span>
+              </div>
+            </td>
+          </tr>
+        `);
+      }
+
+      const filterList = classifyAccountPoolFilters(acc).join(' ');
+      const emoji = getAccountStatusEmoji(acc);
+      const rowClasses = [
+        'ag-pool-row',
+        acc.isCurrent ? 'ag-row-current' : '',
+        acc.isRateLimited ? 'ag-row-cooling' : '',
+      ]
+        .filter(Boolean)
+        .join(' ');
+      const tierClass = acc.hasGemini4
+        ? 'ag-tier-tag ag-tier-g4'
+        : acc.isFreeTier
+        ? 'ag-tier-tag ag-tier-free'
+        : acc.isPaidTier
+        ? 'ag-tier-tag ag-tier-pro'
+        : 'ag-tier-tag';
+      const safeId = escapeHtml(acc.id);
+      const safeEmail = escapeHtml(acc.email);
+      const actionHtml = acc.isCurrent
+        ? `
+          <div class="ag-actions-cell">
+            <span class="ag-badge-active">✓ 当前激活</span>
+            <button class="ag-btn-icon" data-action="refresh-one" data-account-id="${safeId}" title="刷新此账号最新云端额度">↻</button>
+          </div>
+        `
+        : `
+          <div class="ag-actions-cell">
+            <button class="ag-btn-switch" data-action="switch-acc" data-account-id="${safeId}" title="一键切换到 ${safeEmail}">⚡ 切换</button>
+            <button class="ag-btn-icon" data-action="refresh-one" data-account-id="${safeId}" title="刷新此账号最新云端额度">↻</button>
+          </div>
+        `;
+      const updatedStr = acc.quotaUpdatedAt
+        ? `同步于 ${escapeHtml(
+            formatShortLocalResetTime(new Date(acc.quotaUpdatedAt * 1000).toISOString(), nowMs)
+          )}`
+        : '';
+      const currentBadge = acc.isCurrent
+        ? '<span class="ag-pill ag-pill-current">✓ 当前激活</span>'
+        : '';
+      const customLabel = acc.name && acc.name !== acc.email
+        ? `<span style="font-size:11px;color:var(--text-muted);">(${escapeHtml(acc.name)})</span>`
+        : '';
+
+      rowsList.push(`
+        <tr class="${rowClasses}" data-filters="${escapeHtml(filterList)}">
+          <td>
+            <div class="ag-acc-main">
+              <span>${emoji}</span>
+              <span>${safeEmail}</span>
+              ${currentBadge}
+              ${customLabel}
+            </div>
+            <div class="ag-acc-meta">
+              <span class="${tierClass}">${escapeHtml(acc.tierDisplay)}</span>
+              ${
+                acc.isFreeTier
+                  ? '<span class="ag-stat-chip-free" style="padding:1px 7px;border-radius:999px;font-size:10.5px;">🆓 Starter 基础体验</span>'
+                  : acc.hasGemini4
+                  ? '<span class="ag-pill ag-pill-g4">G4 Argon + Opus 5.5</span>'
+                  : acc.hasGemini38
+                  ? '<span style="color:#94a3b8;">Gemini 3.8 + Opus 4.6</span>'
+                  : ''
+              }
+              ${updatedStr ? `<span>· ${updatedStr}</span>` : ''}
+            </div>
+          </td>
+          <td>${renderG4Cell(acc, nowMs)}</td>
+          <td>${renderGemini38Cell(acc, nowMs)}</td>
+          <td>${renderClaudeCell(acc, nowMs)}</td>
+          <td>${actionHtml}</td>
+        </tr>
+      `);
+    }
+  }
+  const rowsHtml = rowsList.join('');
 
   return `
 
@@ -1240,7 +1215,7 @@ export function renderAccountPoolSection(
 
               <th>Gemini 3.8 &amp; 生图 (剩余 / 刷新时间)</th>
 
-              <th>Claude Opus (剩余 / 刷新时间)</th>
+              <th>Claude 模型 (剩余 / 刷新时间)</th>
 
               <th>操作</th>
 

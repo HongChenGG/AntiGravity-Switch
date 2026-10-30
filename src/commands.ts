@@ -244,6 +244,9 @@ export class CommandController {
     if (rank === 3) {
       return '❓ 待同步额度账号';
     }
+    if (rank === 4) {
+      return `🆓 免费体验账号 (Free Starter · 共 ${pool.freeTotal ?? 0} 个 · 可用 ${pool.usableFree ?? 0} 个)`;
+    }
     return '🚫 受限 / 已禁用账号';
   }
 
