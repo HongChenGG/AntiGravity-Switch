@@ -1194,8 +1194,19 @@ export class DashboardPanel {
             const accountId = btn.getAttribute('data-account-id');
             if (!accountId) return;
             if (action === 'switch-acc') {
+              if (btn.disabled || btn.classList.contains('loading')) return;
+              document.querySelectorAll('.ag-btn-switch').forEach((b) => {
+                b.setAttribute('disabled', 'true');
+                b.style.opacity = '0.55';
+                b.style.pointerEvents = 'none';
+              });
+              btn.innerHTML = '⏳ 切换中...';
+              btn.classList.add('loading');
               vscode.postMessage({ command: 'switchToAccount', accountId });
             } else if (action === 'refresh-one') {
+              if (btn.disabled || btn.classList.contains('loading')) return;
+              btn.innerHTML = '⏳';
+              btn.classList.add('loading');
               vscode.postMessage({ command: 'refreshSingleAccount', accountId });
             }
           });
