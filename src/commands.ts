@@ -182,8 +182,27 @@ export class CommandController {
     }
   }
 
-  public async reloadExtensionHost(): Promise<void> {
+  /**
+   * 扩展宿主重启前先持久化面板恢复状态并主动销毁现有 Webview 面板，
+   * 防止 Webview 未清理或 retainContextWhenHidden 引起二次切号时宿主卡死。
+   */
+  private async restartExtensionHostCleanly(): Promise<void> {
+    const wasDashboardOpen = DashboardPanel.isOpen();
     await this.context.globalState.update('antigravity.autoFocusPanelAfterReload', true);
+    await this.context.globalState.update(
+      'antigravity.reopenDashboardAfterReload',
+      wasDashboardOpen
+    );
+    DashboardPanel.closeCurrent();
+    await new Promise((r) => setTimeout(r, 200));
+    try {
+      await vscode.commands.executeCommand('workbench.action.restartExtensionHost');
+    } catch {
+      await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }
+  }
+
+  public async reloadExtensionHost(): Promise<void> {
     vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -191,17 +210,12 @@ export class CommandController {
         cancellable: false,
       },
       async () => {
-        try {
-          await vscode.commands.executeCommand('workbench.action.restartExtensionHost');
-        } catch {
-          await vscode.commands.executeCommand('workbench.action.reloadWindow');
-        }
+        await this.restartExtensionHostCleanly();
       }
     );
   }
 
   public async restartBackend(): Promise<void> {
-    await this.context.globalState.update('antigravity.autoFocusPanelAfterReload', true);
     vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -211,15 +225,10 @@ export class CommandController {
       async () => {
         // Kill backend
         await this.service.restartAgyBackend();
-        // Wait 800ms for Windows socket/port to fully release
-        await new Promise((r) => setTimeout(r, 800));
+        // Wait 600ms for Windows socket/port to fully release
+        await new Promise((r) => setTimeout(r, 600));
 
-        // Restart extension host cleanly
-        try {
-          await vscode.commands.executeCommand('workbench.action.restartExtensionHost');
-        } catch {
-          await vscode.commands.executeCommand('workbench.action.reloadWindow');
-        }
+        await this.restartExtensionHostCleanly();
       }
     );
   }
@@ -355,14 +364,7 @@ export class CommandController {
             );
             await this.refreshCallback();
 
-            await this.context.globalState.update('antigravity.autoFocusPanelAfterReload', true);
-            // Wait 600ms then reload extension host
-            await new Promise((r) => setTimeout(r, 600));
-            try {
-              await vscode.commands.executeCommand('workbench.action.restartExtensionHost');
-            } catch {
-              await vscode.commands.executeCommand('workbench.action.reloadWindow');
-            }
+            await this.restartExtensionHostCleanly();
           } else {
             vscode.window.showErrorMessage(`切换账号失败: ${res.message}`);
           }

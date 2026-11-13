@@ -125,13 +125,33 @@ class DashboardPanel {
                         break;
                     case 'refreshSingleAccount':
                         if (typeof message.accountId === 'string' && message.accountId.trim()) {
-                            const res = await this.service.refreshAccountOnlineById(message.accountId.trim());
+                            const targetId = message.accountId.trim();
+                            const res = await this.service.refreshAccountOnlineById(targetId);
                             await this.update();
+                            if (!this.disposed) {
+                                this.panel.webview.postMessage({
+                                    command: 'resetRefreshButton',
+                                    accountId: targetId,
+                                });
+                            }
                             if (res.success) {
-                                vscode.window.showInformationMessage(`✅ 已刷新账号 ${res.email || message.accountId} 的最新云端额度！`);
+                                vscode.window.showInformationMessage(`✅ 已刷新账号 ${res.email || targetId} 的最新云端额度！`);
                             }
                             else {
-                                vscode.window.showWarningMessage(`刷新账号失败 (${res.email || message.accountId}): ${res.error || '未知错误'}`);
+                                vscode.window.showWarningMessage(`刷新账号失败 (${res.email || targetId}): ${res.error || '未知错误'}`);
+                            }
+                        }
+                        break;
+                    case 'toggleDisableAccount':
+                        if (typeof message.accountId === 'string' && message.accountId.trim()) {
+                            const targetId = message.accountId.trim();
+                            const res = await this.service.setAccountDisabled(targetId, Boolean(message.disabled));
+                            await this.update();
+                            if (res.success) {
+                                vscode.window.showInformationMessage(res.message);
+                            }
+                            else {
+                                vscode.window.showWarningMessage(res.message);
                             }
                         }
                         break;
@@ -143,12 +163,18 @@ class DashboardPanel {
                         break;
                     case 'switchAccount':
                         await this.onSwitchAccountRequested();
-                        await this.update();
+                        if (!this.disposed) {
+                            this.panel.webview.postMessage({ command: 'resetSwitchButtons' });
+                            await this.update();
+                        }
                         break;
                     case 'switchToAccount':
                         if (typeof message.accountId === 'string' && message.accountId.trim()) {
                             await this.onSwitchAccountRequested(message.accountId.trim());
-                            await this.update();
+                            if (!this.disposed) {
+                                this.panel.webview.postMessage({ command: 'resetSwitchButtons' });
+                                await this.update();
+                            }
                         }
                         break;
                     case 'importAccount':
@@ -178,6 +204,14 @@ class DashboardPanel {
         this.autoRefreshTimer = setInterval(() => {
             this.update();
         }, 4000);
+    }
+    static isOpen() {
+        return Boolean(DashboardPanel.currentPanel && !DashboardPanel.currentPanel.disposed);
+    }
+    static closeCurrent() {
+        if (DashboardPanel.currentPanel && !DashboardPanel.currentPanel.disposed) {
+            DashboardPanel.currentPanel.dispose();
+        }
     }
     static createOrShow(service, onReloadRequested, onRestartBackendRequested, onSwitchAccountRequested, onImportAccountRequested, onRefreshAllQuotasRequested) {
         const column = vscode.window.activeTextEditor
@@ -1102,6 +1136,36 @@ class DashboardPanel {
               btn.innerHTML = '⏳';
               btn.classList.add('loading');
               vscode.postMessage({ command: 'refreshSingleAccount', accountId });
+            } else if (action === 'toggle-disable') {
+              if (btn.disabled || btn.classList.contains('loading')) return;
+              const currentlyDisabled = btn.getAttribute('data-disabled') === '1';
+              btn.innerHTML = '⏳';
+              btn.classList.add('loading');
+              vscode.postMessage({
+                command: 'toggleDisableAccount',
+                accountId,
+                disabled: !currentlyDisabled,
+              });
+            }
+          });
+          window.addEventListener('message', (event) => {
+            const msg = event.data;
+            if (!msg || typeof msg !== 'object') return;
+            if (msg.command === 'resetSwitchButtons') {
+              document.querySelectorAll('.ag-btn-switch').forEach((b) => {
+                b.removeAttribute('disabled');
+                b.style.opacity = '';
+                b.style.pointerEvents = '';
+                b.classList.remove('loading');
+                b.innerHTML = '⚡ 切换';
+              });
+            } else if (msg.command === 'resetRefreshButton' && msg.accountId) {
+              document.querySelectorAll('[data-action="refresh-one"]').forEach((b) => {
+                if (b.getAttribute('data-account-id') === msg.accountId) {
+                  b.classList.remove('loading');
+                  b.innerHTML = '↻';
+                }
+              });
             }
           });
           (function restorePoolFilter() {

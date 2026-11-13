@@ -305,6 +305,31 @@ function safeParseTimeMs(iso: string | undefined | null): number | null {
   return isNaN(ms) ? null : ms;
 }
 
+/**
+ * 判断账号 live models 列表中是否仍包含 Gemini 4 / Opus 5.5 能力指纹。
+ */
+export function hasLiveG4Models(models: ModelQuota[] | undefined | null): boolean {
+  if (!Array.isArray(models) || models.length === 0) {
+    return false;
+  }
+  return models.some((m) =>
+    isGemini4CapableModelName(
+      `${m.name || ''} ${m.display_name || (m as any).displayName || ''}`
+    )
+  );
+}
+
+/**
+ * 判断 ISO 重置时间是否已经过期（<= nowMs）。
+ */
+export function isQuotaResetExpired(
+  resetTimeIso: string | undefined | null,
+  nowMs: number = Date.now()
+): boolean {
+  const target = safeParseTimeMs(resetTimeIso);
+  return target !== null && target <= nowMs;
+}
+
 export function formatCountdownHuman(
   resetTimeIso: string | undefined | null,
   nowMs: number = Date.now()
@@ -332,6 +357,20 @@ export function formatCountdownHuman(
     return `${hours}小时${mins}分后`;
   }
   return `${Math.max(1, mins)}分钟后`;
+}
+
+/**
+ * 格式化带“重置”后缀的重置时间文案，避免出现“已重置重置”重复词。
+ */
+export function formatResetStatusText(
+  resetTimeIso: string | undefined | null,
+  nowMs: number = Date.now()
+): string {
+  const human = formatCountdownHuman(resetTimeIso, nowMs);
+  if (human === '已重置' || human === '未知') {
+    return human;
+  }
+  return `${human}重置`;
 }
 
 /** 紧凑倒计时（用于单行 QuickPick 徽章，如 "3h30m" / "3d5h" / "45m" / "已重置"） */
@@ -536,13 +575,33 @@ function resolveTier(
   const rawTier = (quota?.subscription_tier || '').trim();
   const lower = rawTier.toLowerCase();
 
+  const has5hBucket =
+    families.some((f) => f.fiveHour !== null) ||
+    models.some((m) =>
+      String(m.quota_bucket_id ?? (m as any).quotaBucketId ?? '')
+        .toLowerCase()
+        .includes('5h')
+    );
+  const hasWeeklyFamily = families.some((f) => f.weekly !== null);
+  // 真实降级为 Starter Free 的账号：非 GCP、无 G4/Opus 5.5 权限、无任何 5h 刷新桶，且仅剩周限额池
+  const isConsumerDowngradedToFree =
+    !account.is_gcp_tos && families.length > 0 && hasWeeklyFamily && !has5hBucket && !hasGemini4;
+
   if (lower.includes('ultra')) {
     return { tierKind: 'ultra', tierDisplay: 'Ultra', isPaidTier: true, isFreeTier: false };
   }
   if (lower.includes('pro')) {
+    if (isConsumerDowngradedToFree) {
+      const label = hasImageOnly ? 'Free(仅生图)' : 'Free';
+      return { tierKind: 'free', tierDisplay: label, isPaidTier: false, isFreeTier: true };
+    }
     return { tierKind: 'pro', tierDisplay: 'Pro', isPaidTier: true, isFreeTier: false };
   }
   if (lower.includes('plus')) {
+    if (isConsumerDowngradedToFree) {
+      const label = hasImageOnly ? 'Free(仅生图)' : 'Free';
+      return { tierKind: 'free', tierDisplay: label, isPaidTier: false, isFreeTier: true };
+    }
     return { tierKind: 'plus', tierDisplay: 'Plus', isPaidTier: true, isFreeTier: false };
   }
   if (
@@ -560,11 +619,17 @@ function resolveTier(
 
   // 当 subscription_tier 为 "free-tier" 或空（null/""）时：
   // 旧版 agy-switch 曾把 currentTier.id="free-tier" 写入拥有 3.8/Claude/G4 的付费或 GCP 账号；
-  // 真正的 Free Starter 缺乏 G4/M26/Opus 5.5，且无 3.8/3-1-pro/claude/5h 桶。
-  const has5hBucket = families.some((f) => f.fiveHour !== null);
+  // 真正的 Free Starter 缺乏 G4/Opus 5.5，且非 GCP 账号失去 5h 桶仅剩 weekly 池。
   const hasPaidModelSignal = hasGemini4 || hasGemini38 || hasClaude || has5hBucket;
 
   if (lower === 'free-tier' || lower === 'free' || lower === '') {
+    if (
+      isConsumerDowngradedToFree &&
+      (!account.project_id || account.project_id === 'aicode-consumers')
+    ) {
+      const label = hasImageOnly ? 'Free(仅生图)' : 'Free';
+      return { tierKind: 'free', tierDisplay: label, isPaidTier: false, isFreeTier: true };
+    }
     if (hasPaidModelSignal) {
       const isGcpAccount =
         Boolean(account.is_gcp_tos) ||
@@ -611,13 +676,17 @@ export function summarizeAccount(
     `${m.name || ''} ${m.display_name || (m as any).displayName || ''}`;
   const hasExplicitG4Model = models.some((m) => isExplicitGemini4ModelName(modelIdent(m)));
   const hasOpus55 = models.some((m) => isOpus55ModelName(modelIdent(m)));
+  const modelsHaveG4 = hasLiveG4Models(models);
+  // 若已同步到 live models 列表且其中不含 G4 / Opus 5.5，说明账号已失去 G4 权限，屏蔽残留 Argon 缓存组
+  const effectiveG4Fam = models.length === 0 || modelsHaveG4 ? g4Fam : null;
+  const activeFamilies = effectiveG4Fam ? families : families.filter((f) => f.key !== 'gemini-4');
   const hasOpus = hasOpus55 || models.some((m) => isOpusModelName(modelIdent(m)));
   const hasClaude =
     Boolean(claudeFam) || hasOpus || models.some((m) => isClaudeModelName(modelIdent(m)));
   const hasGemini4 =
-    Boolean(g4Fam) ||
+    Boolean(effectiveG4Fam) ||
     hasExplicitG4Model ||
-    models.some((m) => isGemini4CapableModelName(modelIdent(m)));
+    modelsHaveG4;
   const hasGemini38 =
     models.some((m) => isGemini38ModelName(modelIdent(m))) ||
     (Boolean(geminiFam) && models.length === 0 && !quota?.is_forbidden);
@@ -692,17 +761,24 @@ export function summarizeAccount(
   let g4ResetTime: string | undefined;
   let g4SharesGeminiPool = false;
 
-  if (g4Fam) {
-    g4FiveHourPct = fractionToPct(g4Fam.fiveHour);
-    g4WeeklyPct = fractionToPct(g4Fam.weekly);
+  if (effectiveG4Fam) {
+    g4FiveHourPct = fractionToPct(effectiveG4Fam.fiveHour);
+    g4WeeklyPct = fractionToPct(effectiveG4Fam.weekly);
     const g4Eff = computeEffectiveWindow(
       g4FiveHourPct,
       g4WeeklyPct,
-      g4Fam.fiveHourReset,
-      g4Fam.weeklyReset
+      effectiveG4Fam.fiveHourReset,
+      effectiveG4Fam.weeklyReset
     );
     g4Pct = g4Eff.effectivePct;
     g4ResetTime = g4Eff.effectiveResetTime;
+    // 若缓存的耗尽/扣减 G4 窗口重置时间已到期，清除过时百分比（保留 G4 模型能力标记）等待实测同步
+    if (g4Pct !== null && g4Pct < 100 && isQuotaResetExpired(g4ResetTime, nowMs)) {
+      g4Pct = null;
+      g4FiveHourPct = null;
+      g4WeeklyPct = null;
+      g4ResetTime = undefined;
+    }
   } else if (hasExplicitG4Model) {
     const g4Model = models.find((m) => isExplicitGemini4ModelName(modelIdent(m)))!;
     const rawPct = modelToPct(g4Model);
@@ -764,7 +840,7 @@ export function summarizeAccount(
     account,
     quota,
     models,
-    families,
+    activeFamilies,
     hasGemini4,
     hasGemini38,
     hasClaude,
@@ -876,10 +952,17 @@ export function sortGroupRank(acc: AccountSummary): number {
   return 3;
 }
 
+function g4UsablePriority(acc: AccountSummary): number {
+  if (!acc.hasGemini4) return 0;
+  if (acc.g4Pct !== null && acc.g4Pct > 0) return 2;
+  if (acc.g4Pct === null) return 1;
+  return 0;
+}
+
 /**
  * 智能账号排序：
  * 0. 当前正在使用的账号置顶
- * 1. 可用付费账号（🔥 G4 + Opus 5.5 账号最优先，其次按有效 Gemini 额度 > 档位权重 > Claude 有效额度 降序）
+ * 1. 可用付费账号（尚有 G4 额度的账号最优先，其次待同步 G4 账号，再按有效 Gemini 3.8 额度 > 档位权重 > Claude 有效额度 降序）
  * 2. 限流冷却中的付费账号（0%，按 G4 能力优先、最早恢复时间升序）
  * 3. 未同步配额账号
  * 4. Free Starter 免费账号（按剩余额度降序、最早恢复时间升序）
@@ -895,8 +978,17 @@ export function sortAccountSummaries(accounts: AccountSummary[]): AccountSummary
 
     // 组 1：可用付费账号
     if (rankA === 1) {
-      if (a.hasGemini4 !== b.hasGemini4) {
-        return a.hasGemini4 ? -1 : 1;
+      const g4PrioA = g4UsablePriority(a);
+      const g4PrioB = g4UsablePriority(b);
+      if (g4PrioA !== g4PrioB) {
+        return g4PrioB - g4PrioA;
+      }
+      if (g4PrioA === 2) {
+        const g4A = a.g4Pct ?? 0;
+        const g4B = b.g4Pct ?? 0;
+        if (g4A !== g4B) {
+          return g4B - g4A;
+        }
       }
       const effA = a.effectiveGeminiPct ?? a.g4Pct ?? 0;
       const effB = b.effectiveGeminiPct ?? b.g4Pct ?? 0;
@@ -983,10 +1075,7 @@ export function computePoolStats(summaries: AccountSummary[]): AccountPoolStats 
 
     if (s.hasGemini4) {
       totalG4++;
-      const g4Usable =
-        s.g4Pct !== null
-          ? s.g4Pct > 0
-          : (s.effectiveGeminiPct ?? 0) > 0 || (s.effectiveClaudePct ?? 0) > 0;
+      const g4Usable = s.g4Pct !== null && s.g4Pct > 0;
       if (g4Usable) {
         usableG4++;
       }
@@ -1084,6 +1173,9 @@ export function getAccountStatusEmoji(acc: AccountSummary): string {
   if (acc.isFreeTier || acc.effectiveGeminiPct === null) {
     return '⚪';
   }
+  if (acc.hasGemini4 && acc.g4Pct !== null && acc.g4Pct <= 0) {
+    return '🟡';
+  }
   if (acc.effectiveGeminiPct >= 50) {
     return '🟢';
   }
@@ -1155,13 +1247,17 @@ export function formatAccountQuickPickDisplay(
       gPart = `3.8: ${acc.geminiWeeklyPct}%(周)`;
     }
 
+    const formatCompactReset = (iso: string): string => {
+      const c = formatCountdownCompact(iso, nowMs);
+      return c === '已重置' || c === '未知' ? c : `${c}后重置`;
+    };
     let rPart = '';
     if (acc.gemini5hPct !== null && acc.gemini5hPct < 100 && acc.gemini5hResetTime) {
-      rPart = ` · ⏳5h:${formatCountdownCompact(acc.gemini5hResetTime, nowMs)}后重置`;
+      rPart = ` · ⏳5h:${formatCompactReset(acc.gemini5hResetTime)}`;
     } else if (acc.geminiWeeklyResetTime) {
-      rPart = ` · ⏳周:${formatCountdownCompact(acc.geminiWeeklyResetTime, nowMs)}后重置`;
+      rPart = ` · ⏳周:${formatCompactReset(acc.geminiWeeklyResetTime)}`;
     } else if (acc.gemini5hResetTime) {
-      rPart = ` · ⏳5h:${formatCountdownCompact(acc.gemini5hResetTime, nowMs)}后重置`;
+      rPart = ` · ⏳5h:${formatCompactReset(acc.gemini5hResetTime)}`;
     }
 
     const clLabelShort = acc.hasOpus55 ? 'Opus5.5' : 'Claude';
@@ -1223,9 +1319,12 @@ export function formatAccountQuickPickDisplay(
           : `${acc.effectiveClaudePct ?? '--'}%`;
       const clReset =
         acc.isClaudeRateLimited && acc.claudeResetTime
-          ? ` (🔴 ⏳${formatCountdownHuman(acc.claudeResetTime, nowMs)}恢复)`
+          ? (() => {
+              const h = formatCountdownHuman(acc.claudeResetTime, nowMs);
+              return h === '已重置' ? ' (✅ 已重置)' : ` (🔴 ⏳${h}恢复)`;
+            })()
           : acc.claudeResetTime
-          ? ` (⏳${formatCountdownHuman(acc.claudeResetTime, nowMs)}重置)`
+          ? ` (⏳${formatResetStatusText(acc.claudeResetTime, nowMs)})`
           : '';
       detailSegments.push(`${clLabel}: ${clVal}${clReset}`);
     }

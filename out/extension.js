@@ -46,15 +46,13 @@ let needsRefresh = false;
 function activate(context) {
     const service = new service_1.AntigravityService();
     const statusBar = new statusBar_1.StatusBarController();
-    // If a reload was triggered by our extension, automatically focus the Antigravity panel!
-    if (context.globalState.get('antigravity.autoFocusPanelAfterReload')) {
+    const autoFocusPanelAfterReload = Boolean(context.globalState.get('antigravity.autoFocusPanelAfterReload'));
+    const reopenDashboardAfterReload = Boolean(context.globalState.get('antigravity.reopenDashboardAfterReload'));
+    if (autoFocusPanelAfterReload) {
         context.globalState.update('antigravity.autoFocusPanelAfterReload', false);
-        setTimeout(async () => {
-            try {
-                await vscode.commands.executeCommand('antigravity.panel.focus');
-            }
-            catch { }
-        }, 1200);
+    }
+    if (reopenDashboardAfterReload) {
+        context.globalState.update('antigravity.reopenDashboardAfterReload', false);
     }
     const refresh = async () => {
         // 定时器间隔可能小于 fetchStatus 耗时（CLI 慢时可达数秒），防止刷新堆叠；
@@ -84,6 +82,23 @@ function activate(context) {
         }
     };
     const commandController = new commands_1.CommandController(context, service, refresh, () => currentStatus);
+    // If a reload was triggered by our extension, focus Antigravity panel & restore dashboard if it was open!
+    if (autoFocusPanelAfterReload || reopenDashboardAfterReload) {
+        setTimeout(async () => {
+            if (autoFocusPanelAfterReload) {
+                try {
+                    await vscode.commands.executeCommand('antigravity.panel.focus');
+                }
+                catch { }
+            }
+            if (reopenDashboardAfterReload) {
+                try {
+                    commandController.showDashboard();
+                }
+                catch { }
+            }
+        }, 1200);
+    }
     // Instant notification when quota or configuration change on disk
     service.onStatusChanged(async () => {
         await refresh();

@@ -13,14 +13,17 @@ export function activate(context: vscode.ExtensionContext) {
   const service = new AntigravityService();
   const statusBar = new StatusBarController();
 
-  // If a reload was triggered by our extension, automatically focus the Antigravity panel!
-  if (context.globalState.get<boolean>('antigravity.autoFocusPanelAfterReload')) {
+  const autoFocusPanelAfterReload = Boolean(
+    context.globalState.get<boolean>('antigravity.autoFocusPanelAfterReload')
+  );
+  const reopenDashboardAfterReload = Boolean(
+    context.globalState.get<boolean>('antigravity.reopenDashboardAfterReload')
+  );
+  if (autoFocusPanelAfterReload) {
     context.globalState.update('antigravity.autoFocusPanelAfterReload', false);
-    setTimeout(async () => {
-      try {
-        await vscode.commands.executeCommand('antigravity.panel.focus');
-      } catch {}
-    }, 1200);
+  }
+  if (reopenDashboardAfterReload) {
+    context.globalState.update('antigravity.reopenDashboardAfterReload', false);
   }
 
   const refresh = async (): Promise<void> => {
@@ -55,6 +58,22 @@ export function activate(context: vscode.ExtensionContext) {
     refresh,
     () => currentStatus
   );
+
+  // If a reload was triggered by our extension, focus Antigravity panel & restore dashboard if it was open!
+  if (autoFocusPanelAfterReload || reopenDashboardAfterReload) {
+    setTimeout(async () => {
+      if (autoFocusPanelAfterReload) {
+        try {
+          await vscode.commands.executeCommand('antigravity.panel.focus');
+        } catch {}
+      }
+      if (reopenDashboardAfterReload) {
+        try {
+          commandController.showDashboard();
+        } catch {}
+      }
+    }, 1200);
+  }
 
   // Instant notification when quota or configuration change on disk
   service.onStatusChanged(async () => {

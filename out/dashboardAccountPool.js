@@ -54,15 +54,18 @@ function renderG4Cell(acc, nowMs) {
     }
     if (acc.g4Pct !== null) {
         const resetText = acc.g4ResetTime
-            ? `⏳ ${escapeHtml((0, accountQuota_1.formatCountdownHuman)(acc.g4ResetTime, nowMs))}重置 (${escapeHtml((0, accountQuota_1.formatShortLocalResetTime)(acc.g4ResetTime, nowMs))})`
+            ? `⏳ ${escapeHtml((0, accountQuota_1.formatResetStatusText)(acc.g4ResetTime, nowMs))} (${escapeHtml((0, accountQuota_1.formatShortLocalResetTime)(acc.g4ResetTime, nowMs))})`
             : '独立 Argon 周限额池';
+        const statusBadge = acc.g4Pct <= 0
+            ? '<span class="ag-limit-badge">🔴 G4已耗尽</span>'
+            : '<span class="ag-pill ag-pill-g4">🔥 G4 独立周池</span>';
         return `
 
       <div class="ag-quota-cell">
 
         <div class="ag-quota-top">
 
-          <span class="ag-pill ag-pill-g4">🔥 G4 独立周池</span>
+          ${statusBadge}
 
           <span class="ag-pct-num ${pctTextClass(acc.g4Pct)}">${acc.g4Pct}%</span>
 
@@ -831,13 +834,14 @@ function renderAccountPoolSection(summaries, nowMs = Date.now()) {
         !a.isDisabled &&
         ((a.effectiveGeminiPct !== null && a.effectiveGeminiPct > 0) ||
             (a.g4Pct !== null && a.g4Pct > 0));
+    const isG4Usable = (a) => !a.isForbidden && !a.isDisabled && a.g4Pct !== null && a.g4Pct > 0;
     const g4List = summaries.filter((a) => classifyAccountPoolFilters(a).includes('g4'));
     const proList = summaries.filter((a) => classifyAccountPoolFilters(a).includes('pro'));
     const freeList = summaries.filter((a) => classifyAccountPoolFilters(a).includes('free'));
     const g4Total = g4List.length;
     const proTotal = proList.length;
     const freeTotal = freeList.length;
-    const g4Usable = g4List.filter(isUsable).length;
+    const g4Usable = g4List.filter(isG4Usable).length;
     const proUsable = proList.filter(isUsable).length;
     const freeUsable = freeList.filter(isUsable).length;
     const coolingCount = summaries.filter((a) => a.isRateLimited && !a.isDisabled && !a.isForbidden).length;
@@ -856,7 +860,7 @@ function renderAccountPoolSection(summaries, nowMs = Date.now()) {
           <tr class="ag-pool-row ag-section-row" data-filters="all g4 pro">
             <td colspan="5">
               <div style="display:flex;align-items:center;justify-content:space-between;">
-                <span style="color:#38bdf8;">💎 付费 Pro / G4 账号池 (共 ${g4Total + proTotal} 个 · 可用 ${g4Usable + proUsable} 个)</span>
+                <span style="color:#38bdf8;">💎 付费 Pro / G4 账号池 (共 ${g4Total + proTotal} 个 · 可用 ${stats.usablePro} 个)</span>
                 <span style="font-size:11px;font-weight:normal;color:var(--text-muted);">支持 Gemini 3.8 / 4.0 / Opus 5.5 / 4.6</span>
               </div>
             </td>
@@ -906,6 +910,7 @@ function renderAccountPoolSection(summaries, nowMs = Date.now()) {
                         : 'ag-tier-tag';
             const safeId = escapeHtml(acc.id);
             const safeEmail = escapeHtml(acc.email);
+            const disableBtn = `<button class="ag-btn-icon" data-action="toggle-disable" data-account-id="${safeId}" data-disabled="${acc.isDisabled ? '1' : '0'}" title="${acc.isDisabled ? '恢复启用此账号' : '屏蔽/禁用此账号（如 ToS 403 无法对话）'}">${acc.isDisabled ? '✅' : '🚫'}</button>`;
             const actionHtml = acc.isCurrent
                 ? `
           <div class="ag-actions-cell">
@@ -917,8 +922,23 @@ function renderAccountPoolSection(summaries, nowMs = Date.now()) {
           <div class="ag-actions-cell">
             <button class="ag-btn-switch" data-action="switch-acc" data-account-id="${safeId}" title="一键切换到 ${safeEmail}">⚡ 切换</button>
             <button class="ag-btn-icon" data-action="refresh-one" data-account-id="${safeId}" title="刷新此账号最新云端额度">↻</button>
+            ${disableBtn}
           </div>
         `;
+            const claudeCap = acc.hasOpus55
+                ? 'Opus 5.5'
+                : acc.hasOpus
+                    ? 'Opus 4.6'
+                    : acc.hasClaude
+                        ? 'Claude'
+                        : '';
+            const capHtml = acc.isFreeTier
+                ? `<span class="ag-stat-chip-free" style="padding:1px 7px;border-radius:999px;font-size:10.5px;">${acc.tierDisplay.includes('仅生图') ? '🆓 Starter 生图体验' : '🆓 Starter 基础体验'}</span>`
+                : acc.hasGemini4
+                    ? `<span class="ag-pill ag-pill-g4">${claudeCap ? `G4 Argon + ${claudeCap}` : 'G4 Argon'}</span>`
+                    : acc.hasGemini38 || claudeCap
+                        ? `<span style="color:#94a3b8;">${escapeHtml([acc.hasGemini38 ? 'Gemini 3.8' : '', claudeCap].filter(Boolean).join(' + '))}</span>`
+                        : '';
             const updatedStr = acc.quotaUpdatedAt
                 ? `同步于 ${escapeHtml((0, accountQuota_1.formatShortLocalResetTime)(new Date(acc.quotaUpdatedAt * 1000).toISOString(), nowMs))}`
                 : '';
@@ -939,13 +959,7 @@ function renderAccountPoolSection(summaries, nowMs = Date.now()) {
             </div>
             <div class="ag-acc-meta">
               <span class="${tierClass}">${escapeHtml(acc.tierDisplay)}</span>
-              ${acc.isFreeTier
-                ? '<span class="ag-stat-chip-free" style="padding:1px 7px;border-radius:999px;font-size:10.5px;">🆓 Starter 基础体验</span>'
-                : acc.hasGemini4
-                    ? '<span class="ag-pill ag-pill-g4">G4 Argon + Opus 5.5</span>'
-                    : acc.hasGemini38
-                        ? '<span style="color:#94a3b8;">Gemini 3.8 + Opus 4.6</span>'
-                        : ''}
+              ${capHtml}
               ${updatedStr ? `<span>· ${updatedStr}</span>` : ''}
             </div>
           </td>

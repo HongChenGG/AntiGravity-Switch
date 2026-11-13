@@ -6,6 +6,7 @@ import {
   formatAccountQuickPickDisplay,
   formatCountdownCompact,
   formatCountdownHuman,
+  formatResetStatusText,
   formatShortLocalResetTime,
   fractionToPct,
   getAccountStatusEmoji,
@@ -1107,6 +1108,296 @@ test('8.1 Dashboard Account Pool HTML renderer: renders G4 independent pool, res
   assert.ok(html.includes('data-action="switch-acc"'));
   assert.ok(!html.includes('<script>alert(1)</script>'));
   assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+});
+
+// ============================================================================
+// 9. Channel Downgrade, Dropped G4 Cleanup, Exhausted G4 UX & Sorting Fixes
+// ============================================================================
+
+test('9.1 Downgraded-to-Free and Dropped-G4 Pro accounts move out of G4 to their true channels despite stale tier/cache', () => {
+  const {
+    classifyAccountPoolFilters,
+    renderAccountPoolSection,
+  } = require('../dashboardAccountPool') as typeof import('../dashboardAccountPool');
+
+  // Case A: Stale "Google AI Pro" + stale g4_argon_quotas group, but live models have NO Opus 5.5/G4
+  // and buckets have ONLY weekly limits (no 5h bucket) -> true Free Starter!
+  const downgradedFree = summarizeAccount(
+    makeAccount({
+      id: 'downgraded-free',
+      email: 'kiaodg2@gmail.com',
+      is_gcp_tos: false,
+      project_id: 'aicode-consumers',
+      quota: {
+        subscription_tier: 'Google AI Pro',
+        models: [
+          { name: 'claude-opus-4-6-thinking', percentage: 19, reset_time: isoAfterHours(150) },
+          { name: 'gemini-3.8-flash-high', percentage: 1, reset_time: isoAfterHours(130) },
+        ],
+        quota_groups: [
+          {
+            display_name: 'Gemini Models',
+            buckets: [
+              {
+                bucket_id: 'gemini-weekly',
+                window: 'weekly',
+                remaining_fraction: 0.01,
+                reset_time: isoAfterHours(130),
+              },
+            ],
+          },
+          {
+            display_name: 'Claude / GPT',
+            buckets: [
+              {
+                bucket_id: '3p-weekly',
+                window: 'weekly',
+                remaining_fraction: 0.19,
+                reset_time: isoAfterHours(150),
+              },
+            ],
+          },
+          {
+            display_name: 'Gemini 4 Argon',
+            buckets: [
+              {
+                bucket_id: 'gemini-argon-wtu-weekly',
+                window: 'weekly',
+                remaining_fraction: 0,
+                reset_time: isoAfterHours(-24),
+              },
+            ],
+          },
+        ],
+      },
+    }),
+    BASE_NOW_MS
+  );
+
+  assert.strictEqual(downgradedFree.isFreeTier, true);
+  assert.strictEqual(downgradedFree.isPaidTier, false);
+  assert.strictEqual(downgradedFree.tierKind, 'free');
+  assert.strictEqual(downgradedFree.tierDisplay, 'Free');
+  assert.strictEqual(downgradedFree.hasGemini4, false);
+  assert.strictEqual(downgradedFree.g4Pct, null);
+  assert.deepStrictEqual(classifyAccountPoolFilters(downgradedFree), ['all', 'free']);
+
+  // Case B: Active Pro (has 5h bucket), but live models reverted from Opus 5.5 -> Opus 4.6;
+  // stale Argon cache must be ignored so it routes cleanly to ordinary Pro.
+  const droppedG4Pro = summarizeAccount(
+    makeAccount({
+      id: 'dropped-g4-pro',
+      email: 'dropped-g4@gmail.com',
+      is_gcp_tos: false,
+      quota: {
+        subscription_tier: 'Google AI Pro',
+        models: [
+          { name: 'claude-opus-4-6-thinking', percentage: 100, reset_time: isoAfterHours(4) },
+          { name: 'gemini-3.8-flash-high', percentage: 90, reset_time: isoAfterHours(4) },
+        ],
+        quota_groups: [
+          {
+            display_name: 'Gemini Models',
+            buckets: [
+              {
+                bucket_id: 'gemini-5h',
+                window: '5h',
+                remaining_fraction: 0.9,
+                reset_time: isoAfterHours(4),
+              },
+              {
+                bucket_id: 'gemini-weekly',
+                window: 'weekly',
+                remaining_fraction: 0.85,
+                reset_time: isoAfterHours(100),
+              },
+            ],
+          },
+          {
+            display_name: 'Claude / GPT',
+            buckets: [
+              {
+                bucket_id: '3p-5h',
+                window: '5h',
+                remaining_fraction: 1.0,
+                reset_time: isoAfterHours(4),
+              },
+            ],
+          },
+          {
+            display_name: 'Gemini 4 Argon',
+            buckets: [
+              {
+                bucket_id: 'gemini-argon-wtu-weekly',
+                window: 'weekly',
+                remaining_fraction: 0.42,
+                reset_time: isoAfterHours(120),
+              },
+            ],
+          },
+        ],
+      },
+    }),
+    BASE_NOW_MS
+  );
+
+  assert.strictEqual(droppedG4Pro.isPaidTier, true);
+  assert.strictEqual(droppedG4Pro.isFreeTier, false);
+  assert.strictEqual(droppedG4Pro.tierKind, 'pro');
+  assert.strictEqual(droppedG4Pro.hasGemini4, false);
+  assert.strictEqual(droppedG4Pro.g4Pct, null);
+  assert.strictEqual(droppedG4Pro.hasOpus55, false);
+  assert.strictEqual(droppedG4Pro.hasOpus, true);
+  assert.deepStrictEqual(classifyAccountPoolFilters(droppedG4Pro), ['all', 'pro']);
+
+  const html = renderAccountPoolSection([droppedG4Pro, downgradedFree], BASE_NOW_MS);
+  assert.ok(html.includes('Gemini 3.8 + Opus 4.6'));
+  assert.ok(!html.includes('G4 Argon + Opus 5.5'));
+  assert.ok(html.includes('🆓 Starter 基础体验'));
+  assert.ok(html.includes('data-action="toggle-disable"'));
+  assert.ok(html.includes('🔥 G4 Pro 可用: 0 / 0'));
+  assert.ok(html.includes('🆓 免费 Free: 1 / 1'));
+});
+
+test('9.2 Exhausted G4 (0%), expired G4 cache, usableG4 counts, status emoji, sorting, and reset suffix text', () => {
+  const { renderAccountPoolSection } =
+    require('../dashboardAccountPool') as typeof import('../dashboardAccountPool');
+
+  const g4Usable = summarizeAccount(
+    makeAccount({
+      id: 'g4-usable',
+      email: 'g4-usable@example.com',
+      quota: {
+        subscription_tier: 'Google AI Pro',
+        models: [{ name: 'claude-opus-5-5-high', percentage: 100, reset_time: isoAfterHours(3) }],
+        quota_groups: {
+          'gemini-5h': { remaining_fraction: 0.72, window: '5h', reset_time: isoAfterHours(3) },
+          'gemini-argon-wtu-weekly': {
+            remaining_fraction: 0.07,
+            window: 'weekly',
+            reset_time: isoAfterHours(90),
+          },
+        },
+      },
+    }),
+    BASE_NOW_MS
+  );
+
+  const g4ExhaustedPartial = summarizeAccount(
+    makeAccount({
+      id: 'g4-exhausted',
+      email: 'hollimas723@gmail.com',
+      quota: {
+        subscription_tier: 'Google AI Pro',
+        models: [{ name: 'claude-opus-5-5-high', percentage: 100, reset_time: isoAfterHours(3) }],
+        quota_groups: {
+          'gemini-5h': { remaining_fraction: 1.0, window: '5h', reset_time: isoAfterHours(4) },
+          'gemini-weekly': {
+            remaining_fraction: 0.6,
+            window: 'weekly',
+            reset_time: isoAfterHours(72),
+          },
+          'gemini-argon-wtu-weekly': {
+            remaining_fraction: 0,
+            window: 'weekly',
+            reset_time: isoAfterHours(96),
+          },
+        },
+      },
+    }),
+    BASE_NOW_MS
+  );
+
+  const stdProHigh = summarizeAccount(
+    makeAccount({
+      id: 'std-pro-95',
+      email: 'std95@example.com',
+      quota: {
+        subscription_tier: 'Google AI Pro',
+        models: [
+          { name: 'claude-opus-4-6-thinking', percentage: 100, reset_time: isoAfterHours(4) },
+          { name: 'gemini-3.8-flash-high', percentage: 95, reset_time: isoAfterHours(4) },
+        ],
+        quota_groups: {
+          'gemini-5h': { remaining_fraction: 0.95, window: '5h', reset_time: isoAfterHours(4) },
+          'gemini-weekly': {
+            remaining_fraction: 0.95,
+            window: 'weekly',
+            reset_time: isoAfterHours(100),
+          },
+        },
+      },
+    }),
+    BASE_NOW_MS
+  );
+
+  // G4=0% + 3.8=60% shows yellow caution emoji, NOT green
+  assert.strictEqual(getAccountStatusEmoji(g4ExhaustedPartial), '🟡');
+  assert.strictEqual(getAccountStatusEmoji(g4Usable), '🟢');
+
+  // Exhausted G4 with 3.8=60% sorts BELOW higher-3.8 Pro (95%) and BELOW usable G4 (7%)
+  const sortedIds = sortAccountSummaries([g4ExhaustedPartial, stdProHigh, g4Usable]).map(
+    (s) => s.id
+  );
+  assert.deepStrictEqual(sortedIds, ['g4-usable', 'std-pro-95', 'g4-exhausted']);
+
+  const stats = computePoolStats([g4Usable, g4ExhaustedPartial, stdProHigh]);
+  assert.strictEqual(stats.totalG4, 2);
+  assert.strictEqual(stats.usableG4, 1);
+  assert.strictEqual(stats.usablePro, 3);
+
+  // Expired G4 cached 0% clears stale 0% (retains G4 capability for sync)
+  const expiredG4 = summarizeAccount(
+    makeAccount({
+      id: 'g4-expired',
+      email: 'g4-expired@example.com',
+      quota: {
+        subscription_tier: 'Google AI Pro',
+        models: [{ name: 'claude-opus-5-5-high', percentage: 100, reset_time: isoAfterHours(4) }],
+        quota_groups: {
+          'gemini-5h': { remaining_fraction: 0.8, window: '5h', reset_time: isoAfterHours(4) },
+          'gemini-argon-wtu-weekly': {
+            remaining_fraction: 0,
+            window: 'weekly',
+            reset_time: isoAfterHours(-3),
+          },
+        },
+      },
+    }),
+    BASE_NOW_MS
+  );
+  assert.strictEqual(expiredG4.hasGemini4, true);
+  assert.strictEqual(expiredG4.g4Pct, null);
+
+  // formatResetStatusText & rendered HTML never emit "已重置重置"
+  assert.strictEqual(formatResetStatusText(isoAfterHours(-2), BASE_NOW_MS), '已重置');
+  assert.strictEqual(formatResetStatusText(isoAfterHours(2), BASE_NOW_MS), '2小时0分后重置');
+
+  const html = renderAccountPoolSection([g4Usable, g4ExhaustedPartial, stdProHigh], BASE_NOW_MS);
+  assert.ok(html.includes('🔴 G4已耗尽'));
+  assert.ok(html.includes('🔥 G4 Pro 可用: 1 / 2'));
+  assert.ok(!html.includes('已重置重置'));
+
+  // QuickPick also never duplicates 已重置
+  const expiredQp = formatAccountQuickPickDisplay(
+    summarizeAccount(
+      makeAccount({
+        id: 'qp-expired',
+        email: 'qp-exp@example.com',
+        quota: {
+          subscription_tier: 'Google AI Pro',
+          quota_groups: {
+            'gemini-5h': { remaining_fraction: 0.5, window: '5h', reset_time: isoAfterHours(-1) },
+            '3p-5h': { remaining_fraction: 0.8, window: '5h', reset_time: isoAfterHours(-1) },
+          },
+        },
+      }),
+      BASE_NOW_MS
+    ),
+    BASE_NOW_MS
+  );
+  assert.ok(!expiredQp.description.includes('已重置后重置'));
+  assert.ok(!expiredQp.detail.includes('已重置重置'));
 });
 
 async function runAll(): Promise<void> {

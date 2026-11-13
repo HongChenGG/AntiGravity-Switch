@@ -150,15 +150,16 @@ class StatusBarController {
         md.appendMarkdown('### 🚀 Google Antigravity (反重力) 状态监控\n\n');
         const email = status.account?.email || '未登录/未识别';
         const rawTier = status.account?.quota?.subscription_tier;
-        const tierLabel = rawTier
-            ? `${rawTier}${currentSummary?.capabilityTags.length
-                ? ` (${currentSummary.capabilityTags.join(' · ')})`
-                : ''}`
-            : currentSummary
-                ? `${currentSummary.tierDisplay}${currentSummary.capabilityTags.length
-                    ? ` (${currentSummary.capabilityTags.join(' · ')})`
-                    : ''}`
-                : 'Google AI';
+        const capSuffix = currentSummary?.capabilityTags.length
+            ? ` (${currentSummary.capabilityTags.join(' · ')})`
+            : '';
+        const tierLabel = currentSummary?.isFreeTier
+            ? `${currentSummary.tierDisplay}${capSuffix}`
+            : rawTier
+                ? `${rawTier}${capSuffix}`
+                : currentSummary
+                    ? `${currentSummary.tierDisplay}${capSuffix}`
+                    : 'Google AI';
         const processStatus = status.isAgyRunning
             ? `🟢 运行中 (PID: ${status.agyPid ?? '自动托管'})`
             : '🔴 未检测到后台进程';
@@ -177,8 +178,8 @@ class StatusBarController {
             if (f.key === 'claude-gpt') {
                 continue;
             }
-            const r5 = f.fiveHourReset ? ` (${(0, utils_1.formatTimeRemaining)(f.fiveHourReset)}重置)` : '';
-            const rw = f.weeklyReset ? ` (${(0, utils_1.formatTimeRemaining)(f.weeklyReset)}重置)` : '';
+            const r5 = f.fiveHourReset ? ` (${(0, accountQuota_1.formatResetStatusText)(f.fiveHourReset)})` : '';
+            const rw = f.weeklyReset ? ` (${(0, accountQuota_1.formatResetStatusText)(f.weeklyReset)})` : '';
             md.appendMarkdown(`- **${f.displayName}**: 5h \`${(0, utils_1.formatPercent)(f.fiveHour)}\`${r5} · 周 \`${(0, utils_1.formatPercent)(f.weekly)}\`${rw}\n`);
         }
         if (families.some((f) => f.key !== 'claude-gpt')) {
@@ -186,7 +187,7 @@ class StatusBarController {
         }
         else if (currentSummary && currentSummary.effectiveGeminiPct !== null) {
             const rStr = currentSummary.geminiResetTime
-                ? ` (${(0, utils_1.formatTimeRemaining)(currentSummary.geminiResetTime)}重置)`
+                ? ` (${(0, accountQuota_1.formatResetStatusText)(currentSummary.geminiResetTime)})`
                 : '';
             md.appendMarkdown(`- **Gemini 3.8**: 可用 \`${currentSummary.effectiveGeminiPct}%\`${rStr}\n\n`);
         }

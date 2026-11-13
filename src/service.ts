@@ -30,6 +30,10 @@ import {
 
 import {
 
+  hasLiveG4Models,
+
+  isQuotaResetExpired,
+
   runBoundedBatchRefresh,
 
   sortAccountSummaries,
@@ -616,7 +620,69 @@ export class AntigravityService {
 
   }
 
-  private getG4ArgonPersistentGroup(accountId: string): any | null {
+  private isArgonGroup(group: any): boolean {
+
+    if (!group || typeof group !== 'object') {
+
+      return false;
+
+    }
+
+    const name = String(group.display_name ?? group.displayName ?? '');
+
+    if (/argon|gemini[\s\-_.]*4/i.test(name)) {
+
+      return true;
+
+    }
+
+    if (Array.isArray(group.buckets)) {
+
+      return group.buckets.some((b: any) =>
+
+        /argon|gemini[\s\-_.]*4|\bg4\b|\bm40[0-5]\b/i.test(
+
+          String(b?.bucket_id ?? b?.bucketId ?? '')
+
+        )
+
+      );
+
+    }
+
+    return false;
+
+  }
+
+  private deleteG4ArgonPersistentEntry(accountId: string): void {
+
+    try {
+
+      const toolsDir = getAntigravityToolsDir();
+
+      const p = path.join(toolsDir, 'g4_argon_quotas.json');
+
+      if (!fs.existsSync(p)) {
+
+        return;
+
+      }
+
+      const data = JSON.parse(fs.readFileSync(p, 'utf-8'));
+
+      if (data && typeof data === 'object' && accountId in data) {
+
+        delete data[accountId];
+
+        fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf-8');
+
+      }
+
+    } catch {}
+
+  }
+
+  private getG4ArgonPersistentGroup(accountId: string, nowMs: number = Date.now()): any | null {
 
     try {
 
@@ -640,6 +706,24 @@ export class AntigravityService {
 
         ) {
 
+          const resetTime = info.reset_time || info.resetTime || '';
+
+          const remainingFraction =
+
+            typeof info.remaining_fraction === 'number'
+
+              ? info.remaining_fraction
+
+              : info.remainingFraction ?? 0;
+
+          // 若缓存记录的耗尽/非满额 Argon 重置时间已经过去，则不再注入过时缓存
+
+          if (remainingFraction < 1 && isQuotaResetExpired(resetTime, nowMs)) {
+
+            return null;
+
+          }
+
           return {
 
             display_name: 'Gemini 4 Argon',
@@ -654,15 +738,9 @@ export class AntigravityService {
 
                 window: info.window || 'weekly',
 
-                remaining_fraction:
+                remaining_fraction: remainingFraction,
 
-                  typeof info.remaining_fraction === 'number'
-
-                    ? info.remaining_fraction
-
-                    : info.remainingFraction ?? 0,
-
-                reset_time: info.reset_time || info.resetTime || '',
+                reset_time: resetTime,
 
                 display_name: 'Gemini 4 Argon Weekly Limit',
 
@@ -764,31 +842,53 @@ export class AntigravityService {
 
     }
 
-    // 若账号未包含已持久化的 Argon 配额组，且在 g4_argon_quotas.json 中有记录，则合并
+    const modelsList = Array.isArray(result?.models) ? result!.models! : [];
+
+    const hasLiveModelsList = modelsList.length > 0;
+
+    const liveSupportsG4 = hasLiveG4Models(modelsList);
+
+    // 若账号已拉取到 live models 且其中不再包含 G4 / Opus 5.5，说明账号已掉 G4（或降级 Free），清除残留 Argon 缓存组
 
     const diskGroups = result?.quota_groups;
 
     if (Array.isArray(diskGroups)) {
 
-      const hasArgon = diskGroups.some((g: any) =>
+      if (hasLiveModelsList && !liveSupportsG4) {
 
-        /argon|gemini[\s\-_.]*4/i.test(String(g?.display_name ?? g?.displayName ?? ''))
+        const filteredGroups = diskGroups.filter((g: any) => !this.isArgonGroup(g));
 
-      );
-
-      if (!hasArgon) {
-
-        const persistentArgon = this.getG4ArgonPersistentGroup(accountId);
-
-        if (persistentArgon) {
+        if (filteredGroups.length !== diskGroups.length) {
 
           result = {
 
             ...(result || {}),
 
-            quota_groups: [...diskGroups, persistentArgon],
+            quota_groups: filteredGroups,
 
           };
+
+        }
+
+      } else {
+
+        const hasArgon = diskGroups.some((g: any) => this.isArgonGroup(g));
+
+        if (!hasArgon) {
+
+          const persistentArgon = this.getG4ArgonPersistentGroup(accountId);
+
+          if (persistentArgon) {
+
+            result = {
+
+              ...(result || {}),
+
+              quota_groups: [...diskGroups, persistentArgon],
+
+            };
+
+          }
 
         }
 
@@ -810,7 +910,7 @@ export class AntigravityService {
 
     accountId: string,
 
-    options?: { silentNotify?: boolean }
+    options?: { silentNotify?: boolean; skipHubSync?: boolean }
 
   ): Promise<{ success: boolean; accountId: string; email?: string; error?: string }> {
 
@@ -842,11 +942,7 @@ export class AntigravityService {
 
           preservedArgonGroup =
 
-            preGroups.find((g: any) =>
-
-              /argon|gemini[\s\-_.]*4/i.test(String(g?.display_name ?? g?.displayName ?? ''))
-
-            ) || null;
+            preGroups.find((g: any) => this.isArgonGroup(g)) || null;
 
         }
 
@@ -880,27 +976,93 @@ export class AntigravityService {
 
     // 若为当前激活账号，尝试从本地运行中的 agy.exe --hub RPC 读取独立 Gemini 4 Argon 周限额桶；
 
-    // 若非激活账号但此前已缓存过独立 Argon 桶且 agy-switch 未返回该组，则予以保留不被抹除。
+    // 若账号已失去 G4 / Opus 5.5 权限，则清理残留 Argon 组与持久化记录；否则保留未过期的独立 Argon 桶。
 
-    const argonToRestore = preservedArgonGroup || this.getG4ArgonPersistentGroup(accountId);
+    const persistentArgon = this.getG4ArgonPersistentGroup(accountId);
+
+    const validPreservedArgon = (() => {
+
+      if (!preservedArgonGroup) return null;
+
+      const b = Array.isArray(preservedArgonGroup.buckets)
+
+        ? preservedArgonGroup.buckets[0]
+
+        : null;
+
+      if (b) {
+
+        const frac =
+
+          typeof b.remaining_fraction === 'number'
+
+            ? b.remaining_fraction
+
+            : b.remainingFraction ?? 0;
+
+        const rTime = b.reset_time || b.resetTime || '';
+
+        if (frac < 1 && isQuotaResetExpired(rTime)) {
+
+          return null;
+
+        }
+
+      }
+
+      return preservedArgonGroup;
+
+    })();
+
+    const argonToRestore = persistentArgon || validPreservedArgon;
 
     const isCurrentAcc = accountId === this.getCurrentAccountId();
 
-    if (isCurrentAcc) {
+    if (isCurrentAcc && !options?.skipHubSync) {
 
       await this.syncActiveAccountFromAgyHub(accountId, true).catch(() => {});
 
-    } else if (argonToRestore && fs.existsSync(detailPath)) {
+    } else if (fs.existsSync(detailPath)) {
 
       try {
 
         const postDetail = JSON.parse(fs.readFileSync(detailPath, 'utf-8'));
 
-        if (Array.isArray(postDetail?.quota?.quota_groups)) {
+        const postModels = Array.isArray(postDetail?.quota?.models) ? postDetail.quota.models : [];
+
+        const postHasLiveModels = postModels.length > 0;
+
+        const postSupportsG4 = hasLiveG4Models(postModels);
+
+        if (postHasLiveModels && !postSupportsG4) {
+
+          // 该账号在云端 live models 中已无 G4 / Opus 5.5，移除旧 Argon 缓存组及持久化索引
+
+          this.deleteG4ArgonPersistentEntry(accountId);
+
+          if (Array.isArray(postDetail?.quota?.quota_groups)) {
+
+            const cleaned = postDetail.quota.quota_groups.filter(
+
+              (g: any) => !this.isArgonGroup(g)
+
+            );
+
+            if (cleaned.length !== postDetail.quota.quota_groups.length) {
+
+              postDetail.quota.quota_groups = cleaned;
+
+              fs.writeFileSync(detailPath, JSON.stringify(postDetail, null, 2), 'utf-8');
+
+            }
+
+          }
+
+        } else if (argonToRestore && Array.isArray(postDetail?.quota?.quota_groups)) {
 
           const hasArgonNow = postDetail.quota.quota_groups.some((g: any) =>
 
-            /argon|gemini[\s\-_.]*4/i.test(String(g?.display_name ?? g?.displayName ?? ''))
+            this.isArgonGroup(g)
 
           );
 
@@ -1229,6 +1391,10 @@ export class AntigravityService {
         if (argonBucket && detail.email) {
 
           this.saveG4ArgonPersistentGroup(currentId, detail.email, argonBucket);
+
+        } else {
+
+          this.deleteG4ArgonPersistentEntry(currentId);
 
         }
 
@@ -2028,17 +2194,25 @@ export class AntigravityService {
 
       const newId = this.getCurrentAccountId();
 
-      // 云端配额刷新与重启后端并行：refresh 独立连 Google、不依赖 agy.exe，
+      // 先进行有界（<= 2.5s）云端配额刷新并跳过旧 hub 探测，再杀 agy.exe，避免后端空窗期间阻塞过久触发扩展宿主卡死
 
-      // 串行等待会白白多花最多 6 秒
+      if (newId) {
 
-      const refreshPromise = newId
+        await Promise.race([
 
-        ? this.refreshAccountOnlineById(newId, { silentNotify: true }).catch(() => {})
+          this.refreshAccountOnlineById(newId, { silentNotify: true, skipHubSync: true }).catch(
 
-        : Promise.resolve();
+            () => {}
 
-      await Promise.all([refreshPromise, this.restartAgyBackend()]);
+          ),
+
+          new Promise<void>((resolve) => setTimeout(resolve, 2500)),
+
+        ]);
+
+      }
+
+      await this.restartAgyBackend();
 
       this.invalidateAccountsCache();
 
@@ -2065,6 +2239,114 @@ export class AntigravityService {
       }, 1500);
 
     }
+
+  }
+
+  /**
+   * 手动切换账号的禁用（屏蔽）状态，同时更新 accounts.json 与 accounts/<id>.json；
+   * 适用于配额 接口返回 200 但对话实际上被 ToS 403 拦截的账号。
+   */
+  public async setAccountDisabled(
+
+    accountId: string,
+
+    disabled: boolean
+
+  ): Promise<{ success: boolean; disabled: boolean; email?: string; message: string }> {
+
+    if (!accountId) {
+
+      return { success: false, disabled, message: '缺少账号 ID' };
+
+    }
+
+    const toolsDir = getAntigravityToolsDir();
+
+    const accountsJsonPath = path.join(toolsDir, 'accounts.json');
+
+    const detailPath = path.join(toolsDir, 'accounts', `${accountId}.json`);
+
+    let email: string | undefined;
+
+    let updatedAny = false;
+
+    this.isSuppressingDirWatchNotify = true;
+
+    try {
+
+      if (fs.existsSync(accountsJsonPath)) {
+
+        try {
+
+          const data = JSON.parse(fs.readFileSync(accountsJsonPath, 'utf-8'));
+
+          if (Array.isArray(data?.accounts)) {
+
+            const entry = data.accounts.find((a: any) => a && a.id === accountId);
+
+            if (entry) {
+
+              entry.disabled = disabled;
+
+              email = entry.email || email;
+
+              fs.writeFileSync(accountsJsonPath, JSON.stringify(data, null, 2), 'utf-8');
+
+              updatedAny = true;
+
+            }
+
+          }
+
+        } catch {}
+
+      }
+
+      if (fs.existsSync(detailPath)) {
+
+        try {
+
+          const detail = JSON.parse(fs.readFileSync(detailPath, 'utf-8'));
+
+          detail.disabled = disabled;
+
+          email = detail.email || email;
+
+          fs.writeFileSync(detailPath, JSON.stringify(detail, null, 2), 'utf-8');
+
+          updatedAny = true;
+
+        } catch {}
+
+      }
+
+    } finally {
+
+      this.isSuppressingDirWatchNotify = false;
+
+    }
+
+    if (!updatedAny) {
+
+      return { success: false, disabled, message: `未找到账号记录: ${accountId}` };
+
+    }
+
+    this.invalidateAccountsCache();
+
+    this.notifyStatusChanged();
+
+    return {
+
+      success: true,
+
+      disabled,
+
+      email,
+
+      message: `${email || accountId} 已${disabled ? '禁用（屏蔽）' : '恢复启用'}`,
+
+    };
 
   }
 

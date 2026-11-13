@@ -2,7 +2,7 @@
   "name": "antigravity-status-bar",
   "displayName": "Google Antigravity Status & Reload",
   "description": "VS Code 状态栏反重力插件监控：实时展示多账号池剩余额度与重置倒计时、5小时配额、周配额、高颜值Token仪表盘，支持并发刷新全池额度与一键热切号",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "publisher": "local-dev",
   "engines": {
     "vscode": "^1.80.0"

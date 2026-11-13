@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { AccountSummary, AntigravityStatus, QuotaFamily } from './types';
 import {
   computePoolStats,
+  formatResetStatusText,
   normalizeQuotaGroups,
   summarizeAccount,
 } from './accountQuota';
@@ -179,18 +180,15 @@ export class StatusBarController {
 
     const email = status.account?.email || '未登录/未识别';
     const rawTier = status.account?.quota?.subscription_tier;
-    const tierLabel = rawTier
-      ? `${rawTier}${
-          currentSummary?.capabilityTags.length
-            ? ` (${currentSummary.capabilityTags.join(' · ')})`
-            : ''
-        }`
+    const capSuffix = currentSummary?.capabilityTags.length
+      ? ` (${currentSummary.capabilityTags.join(' · ')})`
+      : '';
+    const tierLabel = currentSummary?.isFreeTier
+      ? `${currentSummary.tierDisplay}${capSuffix}`
+      : rawTier
+      ? `${rawTier}${capSuffix}`
       : currentSummary
-      ? `${currentSummary.tierDisplay}${
-          currentSummary.capabilityTags.length
-            ? ` (${currentSummary.capabilityTags.join(' · ')})`
-            : ''
-        }`
+      ? `${currentSummary.tierDisplay}${capSuffix}`
       : 'Google AI';
     const processStatus = status.isAgyRunning
       ? `🟢 运行中 (PID: ${status.agyPid ?? '自动托管'})`
@@ -215,8 +213,8 @@ export class StatusBarController {
       if (f.key === 'claude-gpt') {
         continue;
       }
-      const r5 = f.fiveHourReset ? ` (${formatTimeRemaining(f.fiveHourReset)}重置)` : '';
-      const rw = f.weeklyReset ? ` (${formatTimeRemaining(f.weeklyReset)}重置)` : '';
+      const r5 = f.fiveHourReset ? ` (${formatResetStatusText(f.fiveHourReset)})` : '';
+      const rw = f.weeklyReset ? ` (${formatResetStatusText(f.weeklyReset)})` : '';
       md.appendMarkdown(
         `- **${f.displayName}**: 5h \`${formatPercent(f.fiveHour)}\`${r5} · 周 \`${formatPercent(
           f.weekly
@@ -227,7 +225,7 @@ export class StatusBarController {
       md.appendMarkdown('\n');
     } else if (currentSummary && currentSummary.effectiveGeminiPct !== null) {
       const rStr = currentSummary.geminiResetTime
-        ? ` (${formatTimeRemaining(currentSummary.geminiResetTime)}重置)`
+        ? ` (${formatResetStatusText(currentSummary.geminiResetTime)})`
         : '';
       md.appendMarkdown(
         `- **Gemini 3.8**: 可用 \`${currentSummary.effectiveGeminiPct}%\`${rStr}\n\n`

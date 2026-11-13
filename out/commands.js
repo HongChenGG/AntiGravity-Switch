@@ -179,23 +179,33 @@ class CommandController {
             await this.switchAccount();
         }
     }
-    async reloadExtensionHost() {
+    /**
+     * 扩展宿主重启前先持久化面板恢复状态并主动销毁现有 Webview 面板，
+     * 防止 Webview 未清理或 retainContextWhenHidden 引起二次切号时宿主卡死。
+     */
+    async restartExtensionHostCleanly() {
+        const wasDashboardOpen = dashboardPanel_1.DashboardPanel.isOpen();
         await this.context.globalState.update('antigravity.autoFocusPanelAfterReload', true);
+        await this.context.globalState.update('antigravity.reopenDashboardAfterReload', wasDashboardOpen);
+        dashboardPanel_1.DashboardPanel.closeCurrent();
+        await new Promise((r) => setTimeout(r, 200));
+        try {
+            await vscode.commands.executeCommand('workbench.action.restartExtensionHost');
+        }
+        catch {
+            await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+    }
+    async reloadExtensionHost() {
         vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: '正在平滑重载扩展宿主...',
             cancellable: false,
         }, async () => {
-            try {
-                await vscode.commands.executeCommand('workbench.action.restartExtensionHost');
-            }
-            catch {
-                await vscode.commands.executeCommand('workbench.action.reloadWindow');
-            }
+            await this.restartExtensionHostCleanly();
         });
     }
     async restartBackend() {
-        await this.context.globalState.update('antigravity.autoFocusPanelAfterReload', true);
         vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: '正在终止旧后端并重新拉起 agy.exe...',
@@ -203,15 +213,9 @@ class CommandController {
         }, async () => {
             // Kill backend
             await this.service.restartAgyBackend();
-            // Wait 800ms for Windows socket/port to fully release
-            await new Promise((r) => setTimeout(r, 800));
-            // Restart extension host cleanly
-            try {
-                await vscode.commands.executeCommand('workbench.action.restartExtensionHost');
-            }
-            catch {
-                await vscode.commands.executeCommand('workbench.action.reloadWindow');
-            }
+            // Wait 600ms for Windows socket/port to fully release
+            await new Promise((r) => setTimeout(r, 600));
+            await this.restartExtensionHostCleanly();
         });
     }
     getSectionHeaderForAccount(acc, pool) {
@@ -314,15 +318,7 @@ class CommandController {
                 if (res.success) {
                     vscode.window.showInformationMessage(`账号已成功切换为 ${displayEmail}！已重新拉起新凭据。`);
                     await this.refreshCallback();
-                    await this.context.globalState.update('antigravity.autoFocusPanelAfterReload', true);
-                    // Wait 600ms then reload extension host
-                    await new Promise((r) => setTimeout(r, 600));
-                    try {
-                        await vscode.commands.executeCommand('workbench.action.restartExtensionHost');
-                    }
-                    catch {
-                        await vscode.commands.executeCommand('workbench.action.reloadWindow');
-                    }
+                    await this.restartExtensionHostCleanly();
                 }
                 else {
                     vscode.window.showErrorMessage(`切换账号失败: ${res.message}`);
